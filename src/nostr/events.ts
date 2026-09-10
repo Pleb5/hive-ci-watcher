@@ -175,11 +175,8 @@ export interface LoomWorker {
 /**
  * Parses a kind 10100 loom worker advertisement.
  *
- * Mirrors `budabit-pipelines-extension`'s `parseLoomWorker` so the watcher's
- * notion of "free" is identical to the UI's: only the absence of every `price`
- * tag counts. A malformed paid ad (NaN / zero / negative rate) keeps its
- * pricing object and is therefore excluded by the free filter — never fail
- * open into an unpaid 5100 the worker would silently reject.
+ * Mirrors `budabit-pipelines-extension`'s `parseLoomWorker`, so the watcher's
+ * reading of an ad matches the UI's field for field.
  */
 export function parseLoomWorker(event: NostrEvent): LoomWorker | null {
   if (event.kind !== KIND_LOOM_WORKER) return null
@@ -215,10 +212,13 @@ export function parseLoomWorker(event: NostrEvent): LoomWorker | null {
 }
 
 /**
- * A worker that advertises no pricing cannot be prepaid — there is no rate or
- * mint to mint a token against. Those runs go out with no `payment` tag and
- * only execute when the watcher's pubkey sits in the worker's
- * `ALLOW_UNPAID_PUBKEYS`. Only the explicit no-pricing representation counts.
+ * Whether an ad declares no pricing at all.
+ *
+ * Reporting only — runner selection does not gate on this. A worker that runs
+ * unpaid jobs for its `ALLOW_UNPAID_PUBKEYS` freelist still advertises its
+ * public rate, because a kind 10100 is one replaceable event serving every
+ * reader. Only the explicit no-pricing representation counts as free, so a
+ * malformed paid ad (NaN / zero / negative rate) still reads as priced.
  */
 export function isFreeWorker(worker: LoomWorker | null | undefined): boolean {
   return !!worker && worker.pricing == null

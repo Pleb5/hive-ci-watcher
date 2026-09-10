@@ -181,7 +181,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'list_runners',
     {
       description:
-        'The resolved runner pool: allowed ∩ online ∩ free, with the round-robin cursor.',
+        'The resolved runner pool: allowed ∩ online, with the round-robin cursor. ' +
+        'Advertised pricing is reported but does not gate eligibility — pool ' +
+        'membership asserts an unpaid arrangement with the worker.',
       inputSchema: {},
     },
     guarded(ctx, 'allowlisted', () => {
@@ -193,16 +195,20 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         cursor: cursorRaw === null ? 0 : Number.parseInt(cursorRaw, 10) || 0,
         runners: db.listRunnerPool().map(entry => {
           const worker = workers.get(entry.pubkey)
+          const online = !!worker && isWorkerOnline(worker, now)
           return {
             pubkey: entry.pubkey,
             added_at: entry.addedAt,
             known: !!worker,
             name: worker?.name ?? null,
-            online: worker ? isWorkerOnline(worker, now) : false,
-            free: isFreeWorker(worker),
+            online,
+            // Informational only. A worker on our freelist still advertises
+            // its public rate, since a 10100 is one event for every reader.
+            advertises_pricing: !!worker && !isFreeWorker(worker),
+            pricing: worker?.pricing ?? null,
             queue_depth: worker?.currentQueueDepth ?? null,
             last_seen: worker?.lastSeen ?? null,
-            eligible: !!worker && isWorkerOnline(worker, now) && isFreeWorker(worker),
+            eligible: online,
           }
         }),
       })

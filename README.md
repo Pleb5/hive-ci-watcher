@@ -59,30 +59,34 @@ allowlist.
 
 1. Start the daemon and note its pubkey.
 2. Add that pubkey to each loom worker's `ALLOW_UNPAID_PUBKEYS`.
-3. `runners-add` each worker you want to use. The pool is private and is never
-   published; an empty pool means no runs.
+3. `runners-add` each worker you want to use — only workers that now have the
+   watcher pubkey on their `ALLOW_UNPAID_PUBKEYS`. The pool is private and is
+   never published; an empty pool means no runs.
 4. `follow` the repos you want watched.
 5. Optionally publish a kind 30620 trusted-watchers list naming the daemon, so
    clients can show it. It is display metadata only — it does not gate the
    daemon, and removal from a 30620 does not silently unfollow.
 
-## Operational note: what counts as a free runner
+## Operational note: the runner pool is a freelist assertion
 
-A runner is eligible only when it is **allowed ∩ online ∩ free**, and "free"
-means its kind 10100 advertises **no `price` tag at all**. That is deliberate
-and matches `budabit-pipelines-extension`: a 5100 with no `payment` tag is
-exactly what a worker advertising a price silently rejects, so a malformed or
-zero-rate paid ad keeps the paid path rather than failing open.
+A runner is eligible when it is **allowed ∩ online**. "Allowed" is the private
+`runner_pool` table, writable only by the owner via `runners-add`.
 
-At the time of writing, every *named* worker advertising on the public relays
-carries a `price` tag — including one called `loom-free-tier-worker`, whose
-free tier comes from its own `ALLOW_UNPAID_PUBKEYS` rather than from its ad.
-Under this rule none of them is eligible, so `list_runners` will report
-`eligible: false` for them and nothing will dispatch.
+Advertised pricing does **not** gate selection. A kind 10100 is one public
+replaceable event serving every reader, so a worker that runs unpaid jobs for
+the pubkeys in its `ALLOW_UNPAID_PUBKEYS` still advertises its ordinary rate to
+everyone else — `loom-free-tier-worker`, for instance, advertises 0.1 sat/sec.
+Gating on "advertises no price" would exclude exactly the workers you have an
+arrangement with.
 
-Check with `hive-ci-watcher runners` before expecting runs. Until paid workers
-land (see DESIGN.md §8), a usable pool needs a worker that both advertises no
-pricing and has the watcher pubkey in its `ALLOW_UNPAID_PUBKEYS`.
+So `runners-add <pubkey>` means: *the watcher pubkey is on that worker's
+`ALLOW_UNPAID_PUBKEYS`*. The watcher cannot verify this — a freelist is out of
+band and unreadable from Nostr — so getting it wrong shows up as jobs silently
+dropped at the worker, not as an error here. `hive-ci-watcher runners` reports
+each member's `advertises_pricing` and `pricing` so you can see what a worker
+charges the public, but neither field affects eligibility.
+
+Every 5100 the watcher publishes omits the `payment` tag entirely.
 
 ## NixOS
 
@@ -121,7 +125,8 @@ can build itself through its own pipeline.
 
 - `paths` / `paths-ignore` filters (needs a real diff, which a shallow
   single-commit fetch cannot give)
-- paid loom workers — free-only today
+- paid loom workers — every run goes out unpaid, on the strength of the
+  worker's freelist
 - private (encrypted) entries in the 30620 trusted-watcher list
 - a per-repo CI secret store; watcher-triggered runs carry only `HIVE_CI_NSEC`
 - dispatch retries, run supersession, concurrency caps

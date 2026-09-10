@@ -180,9 +180,20 @@ fetched for a branch reuses that tree outright.
 
 ## 5. Dispatch
 
-1. **Select a runner.** Allowed = the `runner_pool` table. Eligible = allowed ∩ online (10100 seen recently) ∩ free (`pricing == null` —
-   a malformed paid ad is *not* treated as free). Round-robin over the eligible
-   set, cursor persisted in SQLite. Empty set → log, no run, no retry.
+1. **Select a runner.** Allowed = the `runner_pool` table. Eligible = allowed ∩
+   online (10100 seen recently). Round-robin over the eligible set, cursor
+   persisted in SQLite. Empty set → log, no run, no retry.
+
+   **Advertised pricing does not gate selection.** A kind 10100 is one public
+   replaceable event serving every reader, so a worker that runs unpaid jobs
+   for the pubkeys in its `ALLOW_UNPAID_PUBKEYS` still advertises its ordinary
+   rate to everyone else. Filtering on `pricing == null` would exclude exactly
+   the workers we have an arrangement with. The pool is owner-only
+   (`runners_add`), and putting a pubkey in it *is* the operator asserting that
+   arrangement — which is the only thing the watcher could go on, since the
+   freelist itself is out of band and unreadable from Nostr. Pricing is still
+   parsed and surfaced by `list_runners` so an operator can see what a pool
+   member charges the public.
 2. Generate an ephemeral keypair for the run.
 3. Resolve the runner script's Blossom URL. The script is a static template —
    everything run-specific arrives through `env` tags — so its sha256 is
@@ -204,6 +215,10 @@ fetched for a branch reuses that tree outright.
 **No user secrets.** Watcher-triggered runs carry only `HIVE_CI_NSEC`. A
 workflow needing repository secrets will not work under a watcher in v1.
 
+**No `payment` tag, ever.** Every run goes out unpaid on the strength of the
+freelist arrangement above. The tag is omitted rather than sent empty — a loom
+worker only treats a job as trusted-unpaid when it is absent.
+
 ---
 
 ## 6. ContextVM surface
@@ -220,7 +235,7 @@ Authorization is by the caller's pubkey, taken from the decrypted inner event
 | `unfollow_repo` | owner, allowlisted | Remove it. |
 | `list_followed` | owner, allowlisted | Followed repos + per-ref last-seen commit. |
 | `status` | owner, allowlisted | Uptime, relay health, runner pool, recent runs. |
-| `list_runners` | owner, allowlisted | Resolved pool: allowed ∩ online ∩ free, with the round-robin cursor. |
+| `list_runners` | owner, allowlisted | Resolved pool: allowed ∩ online, with the round-robin cursor and each member's advertised pricing (reported, not gated). |
 | `runners_add` | owner only | Add a runner pubkey to the pool. |
 | `runners_remove` | owner only | Remove one. |
 | `allow_pubkey` | owner only | Add a requester to the allowlist. |
@@ -271,8 +286,11 @@ Plaintext nsec in env for v1; NIP-49 later.
   path-filtered either). This is the strongest
   argument for a future coordinator model that keeps warm clones per repo and
   serves trigger evaluation to thin watchers.
-- Paid loom workers. Free-only filter today; the runner-selection seam is where
-  payment slots in.
+- Paid loom workers. Every 5100 goes out unpaid today, so a pool member must
+  have the watcher on its `ALLOW_UNPAID_PUBKEYS`; the runner-selection seam is
+  where payment slots in. Until then a worker added to the pool without that
+  arrangement fails at the worker, not here — the watcher cannot read a
+  freelist to check.
 - Private (encrypted) entries in the 30620 trusted-watcher list.
 - Per-repo CI secret store.
 - Dispatch retries, run supersession, concurrency caps.
@@ -333,12 +351,13 @@ wrong, so it is written as pure functions over plain data and tested directly:
   to a newer one.
 - **Cron** — next-occurrence maths, missed fires coalescing to one, a new
   schedule not firing on sight, DST and UTC handling.
-- **Runner selection** — round-robin fairness across restarts, offline and paid
-  runners excluded, a malformed paid ad *not* treated as free, empty pool.
+- **Runner selection** — round-robin fairness across restarts, offline and
+  unknown runners excluded, a *priced* runner still selected (pool membership
+  asserts the freelist arrangement), empty pool.
 - **Event construction** — 5401 and 5100 tag-for-tag against what
-  `budabit-pipelines-extension` emits today; a paid-worker path must never
-  produce a 5100 without a `payment` tag, and an unpaid one must omit the tag
-  rather than send it empty.
+  `budabit-pipelines-extension` emits today; the 5100 must omit the `payment`
+  tag rather than send it empty, including for a runner whose ad carries a
+  price.
 - **Authorization** — every tool against owner / allowlisted / unknown callers,
   and caller identity read from the inner event rather than the gift wrap.
 - **Git fetch** — commit-mismatch rejection and remote fallback, against a

@@ -23,7 +23,7 @@ function workerMap(...workers: LoomWorker[]): Map<string, LoomWorker> {
   return new Map(workers.map(entry => [entry.pubkey, entry]))
 }
 
-describe('free-worker detection', () => {
+describe('pricing detection (reporting only)', () => {
   const ad = (tags: string[][]): NostrEvent => ({
     id: 'x'.repeat(64),
     pubkey: 'a'.repeat(64),
@@ -38,9 +38,9 @@ describe('free-worker detection', () => {
     expect(isFreeWorker(parseLoomWorker(ad([])))).toBe(true)
   })
 
-  it('does NOT treat a malformed paid ad as free', () => {
-    // NaN rate, zero rate, negative rate — all keep the paid path, where a
-    // 5100 without a payment tag would be silently rejected by the worker.
+  it('does NOT read a malformed paid ad as free', () => {
+    // NaN rate, zero rate, negative rate — all still count as priced, so the
+    // reported `advertises_pricing` never understates what a worker charges.
     for (const rate of ['not-a-number', '0', '-5']) {
       const parsed = parseLoomWorker(ad([['price', 'sat', rate, 'second', 'https://mint.example']]))
       expect(isFreeWorker(parsed)).toBe(false)
@@ -54,17 +54,27 @@ describe('runner eligibility', () => {
   const offline = worker({pubkey: 'c'.repeat(64), lastSeen: STALE})
   const unknown = 'd'.repeat(64)
 
-  it('keeps only allowed ∩ online ∩ free', () => {
+  it('keeps only allowed ∩ online', () => {
     const eligible = eligibleRunners({
       allowed: [free.pubkey, paid.pubkey, offline.pubkey, unknown],
       workers: workerMap(free, paid, offline),
       now: NOW,
     })
-    expect(eligible.map(entry => entry.pubkey)).toEqual([free.pubkey])
+    expect(eligible.map(entry => entry.pubkey).sort()).toEqual([free.pubkey, paid.pubkey].sort())
   })
 
-  it('returns an empty set when nothing qualifies', () => {
-    expect(eligibleRunners({allowed: [paid.pubkey], workers: workerMap(paid), now: NOW})).toEqual([])
+  it('selects a worker that advertises a price, because the pool asserts a freelist arrangement', () => {
+    // A kind 10100 is one public event for every reader, so a worker that runs
+    // unpaid jobs for its ALLOW_UNPAID_PUBKEYS still advertises its public
+    // rate. Gating on that would exclude exactly the workers we can use.
+    const eligible = eligibleRunners({allowed: [paid.pubkey], workers: workerMap(paid), now: NOW})
+    expect(eligible.map(entry => entry.pubkey)).toEqual([paid.pubkey])
+  })
+
+  it('still drops an offline or unknown worker', () => {
+    expect(
+      eligibleRunners({allowed: [offline.pubkey, unknown], workers: workerMap(offline), now: NOW}),
+    ).toEqual([])
     expect(selectRunner([], 0)).toBeNull()
   })
 

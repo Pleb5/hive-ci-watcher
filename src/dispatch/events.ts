@@ -60,9 +60,11 @@ export interface LoomJobEventArgs {
 /**
  * Builds the kind 5100 loom job.
  *
- * **No `payment` tag** — free runners only in v1. The tag is omitted entirely
- * rather than sent empty: a loom worker only treats a job as trusted-unpaid
- * when the tag is absent, so an empty one would be rejected.
+ * **No `payment` tag** — every watcher-triggered run goes out unpaid, on the
+ * strength of the watcher pubkey sitting in the worker's
+ * `ALLOW_UNPAID_PUBKEYS`. The tag is omitted entirely rather than sent empty:
+ * a loom worker only treats a job as trusted-unpaid when the tag is absent, so
+ * an empty one would be rejected.
  */
 export function buildLoomJobEvent(args: LoomJobEventArgs): EventTemplate {
   return {

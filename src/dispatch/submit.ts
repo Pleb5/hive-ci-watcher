@@ -62,6 +62,11 @@ function readCursor(db: WatcherDb): number {
  * 5401 anchor, then the 5100 job carrying the run's ephemeral secret key
  * encrypted to that runner.
  *
+ * The 5100 carries no `payment` tag. Selection does not consult the worker's
+ * advertised price: pool membership is the operator asserting that the watcher
+ * is on that worker's `ALLOW_UNPAID_PUBKEYS`, which is the only thing that
+ * makes an unpaid job run.
+ *
  * **No user secrets.** Watcher-triggered runs carry only `HIVE_CI_NSEC`; a
  * workflow needing repository secrets will not work under a watcher in v1.
  *

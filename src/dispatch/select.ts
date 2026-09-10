@@ -1,4 +1,4 @@
-import {isFreeWorker, isWorkerOnline, type LoomWorker} from '../nostr/events.js'
+import {isWorkerOnline, type LoomWorker} from '../nostr/events.js'
 
 export interface EligibleRunner {
   pubkey: string
@@ -6,12 +6,19 @@ export interface EligibleRunner {
 }
 
 /**
- * Eligible = allowed ∩ online ∩ free.
+ * Eligible = allowed ∩ online.
  *
- * "Allowed" is the private `runner_pool` table; "online" is a 10100 seen
- * within the online window; "free" is an ad that declares no pricing at all —
- * a malformed paid ad is *not* treated as free, because a 5100 with no
- * `payment` tag is exactly what such a worker silently rejects.
+ * "Allowed" is the private `runner_pool` table, which only the owner can write
+ * (`runners_add`). Putting a pubkey in it asserts that the watcher is on that
+ * worker's `ALLOW_UNPAID_PUBKEYS` — an out-of-band arrangement the watcher has
+ * no way to read from Nostr.
+ *
+ * A worker's advertised pricing is therefore **not** a gate. A kind 10100 is
+ * one public replaceable event serving every reader, so a worker that runs
+ * unpaid jobs for its freelist still advertises its ordinary rate to everyone
+ * else; gating on `pricing == null` would exclude exactly the workers we have
+ * an arrangement with. Pricing is still parsed and surfaced by `list_runners`
+ * so an operator can see what a pool member charges the public.
  */
 export function eligibleRunners(args: {
   allowed: string[]
@@ -25,7 +32,6 @@ export function eligibleRunners(args: {
     const worker = args.workers.get(pubkey)
     if (!worker) continue
     if (!isWorkerOnline(worker, now)) continue
-    if (!isFreeWorker(worker)) continue
     eligible.push({pubkey, worker})
   }
 

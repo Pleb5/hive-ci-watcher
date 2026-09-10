@@ -1,0 +1,59 @@
+{
+  "name": "hive-ci-watcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless daemon that watches Nostr repositories and dispatches Hive CI runs",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "hive-ci-watcher": "./dist/cli/index.js",
+    "hive-ci-watcherd": "./dist/main.js"
+  },
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "cli": "tsx src/cli/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test"
+  },
+  "dependencies": {
+    "@contextvm/mcp-sdk": "^1.30.0",
+    "@contextvm/sdk": "^0.13.14",
+    "applesauce-core": "^5.2.0",
+    "applesauce-relay": "^5.2.0",
+    "better-sqlite3": "^11.8.0",
+    "blossom-client-sdk": "^5.0.0",
+    "cron-parser": "^4.9.0",
+    "js-yaml": "^4.1.0",
+    "nostr-tools": "^2.19.4",
+    "rxjs": "^7.8.2",
+    "zod": "^4.6.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.2",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.1",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.8.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}

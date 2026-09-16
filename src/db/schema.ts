@@ -8,15 +8,22 @@ CREATE TABLE IF NOT EXISTS followed_repos (
   d_tag          TEXT NOT NULL,
   default_branch TEXT,
   added_by       TEXT NOT NULL,
-  added_at       INTEGER NOT NULL
+  added_at       INTEGER NOT NULL,
+  -- NULL until the first 30618 has been recorded. That first state seeds
+  -- ref_state without dispatching; otherwise following a repo with 200 tags
+  -- would fire 200 runs on sight.
+  seeded_at      INTEGER
 );
 
 -- ref is the full name: refs/heads/main, refs/tags/v1.2.0
+-- A ref that disappears from the state event is tombstoned (deleted_at set),
+-- not dropped, so a reappearance at the same commit is not a new push.
 CREATE TABLE IF NOT EXISTS ref_state (
   repo_addr  TEXT NOT NULL,
   ref        TEXT NOT NULL,
   commit_id  TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
+  deleted_at INTEGER,
   PRIMARY KEY (repo_addr, ref)
 );
 

@@ -53,13 +53,24 @@ export function isDue(cron: string, lastFiredAtMs: number, nowMs: number): numbe
   return occurrence <= nowMs ? occurrence : null
 }
 
+/**
+ * GitHub's floor: a scheduled workflow runs at most once every five minutes.
+ * Enforced on the fire rate rather than the expression, which makes it exact
+ * — an every-minute or every-two-minute cron alike fires every five minutes —
+ * without having to prove anything about an expression's minimum interval.
+ */
+export const MIN_SCHEDULE_INTERVAL_MS = 5 * 60 * 1000
+
 export function selectDueSchedules<T extends {cron: string; lastFiredAt: number}>(
   schedules: T[],
   nowMs: number,
+  minIntervalMs = MIN_SCHEDULE_INTERVAL_MS,
 ): Array<DueSchedule<T>> {
   const due: Array<DueSchedule<T>> = []
   for (const schedule of schedules) {
-    const occurrenceMs = isDue(schedule.cron, schedule.lastFiredAt * 1000, nowMs)
+    const lastFiredMs = schedule.lastFiredAt * 1000
+    if (nowMs - lastFiredMs < minIntervalMs) continue
+    const occurrenceMs = isDue(schedule.cron, lastFiredMs, nowMs)
     if (occurrenceMs !== null) due.push({schedule, occurrenceMs})
   }
   return due

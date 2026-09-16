@@ -10,6 +10,7 @@ export interface FollowedRepo {
   defaultBranch: string | null
   addedBy: string
   addedAt: number
+  seededAt: number | null
 }
 
 export interface RefState {
@@ -17,6 +18,7 @@ export interface RefState {
   ref: string
   commitId: string
   updatedAt: number
+  deletedAt: number | null
 }
 
 export interface ScheduleRow {
@@ -59,8 +61,8 @@ export class WatcherDb {
   followRepo(repo: {repoAddr: string; repoOwner: string; dTag: string; addedBy: string}): void {
     this.db
       .prepare(
-        `INSERT INTO followed_repos (repo_addr, repo_owner, d_tag, default_branch, added_by, added_at)
-         VALUES (?, ?, ?, NULL, ?, ?)
+        `INSERT INTO followed_repos (repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at)
+         VALUES (?, ?, ?, NULL, ?, ?, NULL)
          ON CONFLICT(repo_addr) DO NOTHING`,
       )
       .run(repo.repoAddr, repo.repoOwner, repo.dTag, repo.addedBy, nowSeconds())
@@ -83,7 +85,7 @@ export class WatcherDb {
   listFollowedRepos(): FollowedRepo[] {
     return this.db
       .prepare(
-        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at
+        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at
          FROM followed_repos ORDER BY added_at ASC`,
       )
       .all()
@@ -94,13 +96,14 @@ export class WatcherDb {
         defaultBranch: row.default_branch,
         addedBy: row.added_by,
         addedAt: row.added_at,
+        seededAt: row.seeded_at,
       }))
   }
 
   getFollowedRepo(repoAddr: string): FollowedRepo | null {
     const row: any = this.db
       .prepare(
-        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at
+        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at
          FROM followed_repos WHERE repo_addr = ?`,
       )
       .get(repoAddr)
@@ -112,7 +115,14 @@ export class WatcherDb {
       defaultBranch: row.default_branch,
       addedBy: row.added_by,
       addedAt: row.added_at,
+      seededAt: row.seeded_at,
     }
+  }
+
+  markSeeded(repoAddr: string): void {
+    this.db
+      .prepare('UPDATE followed_repos SET seeded_at = ? WHERE repo_addr = ? AND seeded_at IS NULL')
+      .run(nowSeconds(), repoAddr)
   }
 
   setDefaultBranch(repoAddr: string, defaultBranch: string): void {
@@ -123,29 +133,45 @@ export class WatcherDb {
 
   // ── ref state ───────────────────────────────────────────────────────────
 
+  /** Every row, tombstones included — `diffRefs` needs both. */
   getRefStates(repoAddr: string): RefState[] {
     return this.db
-      .prepare('SELECT repo_addr, ref, commit_id, updated_at FROM ref_state WHERE repo_addr = ?')
+      .prepare('SELECT repo_addr, ref, commit_id, updated_at, deleted_at FROM ref_state WHERE repo_addr = ?')
       .all(repoAddr)
       .map((row: any) => ({
         repoAddr: row.repo_addr,
         ref: row.ref,
         commitId: row.commit_id,
         updatedAt: row.updated_at,
+        deletedAt: row.deleted_at,
       }))
   }
 
+  /** Records a live ref, clearing any tombstone. */
   putRefState(repoAddr: string, ref: string, commitId: string): void {
     this.db
       .prepare(
-        `INSERT INTO ref_state (repo_addr, ref, commit_id, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(repo_addr, ref) DO UPDATE SET commit_id = excluded.commit_id, updated_at = excluded.updated_at`,
+        `INSERT INTO ref_state (repo_addr, ref, commit_id, updated_at, deleted_at) VALUES (?, ?, ?, ?, NULL)
+         ON CONFLICT(repo_addr, ref) DO UPDATE
+           SET commit_id = excluded.commit_id, updated_at = excluded.updated_at, deleted_at = NULL`,
       )
       .run(repoAddr, ref, commitId, nowSeconds())
   }
 
-  deleteRefState(repoAddr: string, ref: string): void {
-    this.db.prepare('DELETE FROM ref_state WHERE repo_addr = ? AND ref = ?').run(repoAddr, ref)
+  /** Writes every ref of a first-seen repo in one transaction, without dispatching. */
+  seedRefStates(repoAddr: string, refs: Array<{ref: string; commitId: string}>): void {
+    const tx = this.db.transaction((addr: string, entries: Array<{ref: string; commitId: string}>) => {
+      for (const entry of entries) this.putRefState(addr, entry.ref, entry.commitId)
+      this.markSeeded(addr)
+    })
+    tx(repoAddr, refs)
+  }
+
+  /** Tombstones a ref: the last commit is kept so a reappearance at it is not a push. */
+  tombstoneRefState(repoAddr: string, ref: string): void {
+    this.db
+      .prepare('UPDATE ref_state SET deleted_at = ? WHERE repo_addr = ? AND ref = ? AND deleted_at IS NULL')
+      .run(nowSeconds(), repoAddr, ref)
   }
 
   // ── schedules ───────────────────────────────────────────────────────────
@@ -226,6 +252,17 @@ export class WatcherDb {
         run.trigger,
         run.createdAt,
       )
+  }
+
+  /** Keeps the newest `keep` rows; the table is an audit tail, not a ledger. */
+  pruneRuns(keep = 5000): number {
+    return this.db
+      .prepare(
+        `DELETE FROM runs WHERE run_id IN (
+           SELECT run_id FROM runs ORDER BY created_at DESC LIMIT -1 OFFSET ?
+         )`,
+      )
+      .run(keep).changes
   }
 
   recentRuns(limit = 20): RunRow[] {

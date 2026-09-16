@@ -107,9 +107,10 @@ describe('runner script hosting', () => {
   })
 
   it('builds curl+bash args pointing at the resolved url', () => {
-    const args = buildRunnerArgs('https://a.example/deadbeef')
+    const hash = sha256Hex(WORKFLOW_RUNNER_SCRIPT)
+    const args = buildRunnerArgs(`https://a.example/${hash}`, hash)
     expect(args[0]).toBe('-c')
-    expect(args[1]).toContain('curl -fsSL "https://a.example/deadbeef"')
+    expect(args[1]).toContain(`curl -fsSL "https://a.example/${hash}"`)
     expect(args[1]).toContain('/tmp/run-workflow.sh')
   })
 })

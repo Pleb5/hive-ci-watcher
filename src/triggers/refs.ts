@@ -10,14 +10,37 @@ export interface RefDescriptor {
   shortName: string
 }
 
+/**
+ * git's own ref-name rules (`git check-ref-format`), applied to the short
+ * name. A 30618 is signed by a maintainer, not produced by git, so nothing
+ * upstream has enforced these — and the short name ends up in
+ * `HIVE_CI_BRANCH`, which the runner script word-splits into `git clone
+ * --branch` on the worker *host*, outside act's container. Anything git
+ * itself would refuse is refused here first.
+ */
+export function isValidRefShortName(name: string): boolean {
+  if (name.length === 0 || name.length > 255) return false
+  if (name === '@') return false
+  if (name.startsWith('-') || name.startsWith('/') || name.endsWith('/')) return false
+  if (name.startsWith('.') || name.endsWith('.') || name.endsWith('.lock')) return false
+  if (name.includes('..') || name.includes('//') || name.includes('@{') || name.includes('/.')) return false
+  // ASCII control chars, DEL, space, and git's reserved punctuation.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f~^:?*[\\]/.test(name)) return false
+  for (const component of name.split('/')) {
+    if (component.endsWith('.lock')) return false
+  }
+  return true
+}
+
 export function describeRef(ref: string): RefDescriptor | null {
   if (ref.startsWith('refs/heads/')) {
     const shortName = ref.slice('refs/heads/'.length)
-    return shortName ? {ref, kind: 'branch', shortName} : null
+    return isValidRefShortName(shortName) ? {ref, kind: 'branch', shortName} : null
   }
   if (ref.startsWith('refs/tags/')) {
     const shortName = ref.slice('refs/tags/'.length)
-    return shortName ? {ref, kind: 'tag', shortName} : null
+    return isValidRefShortName(shortName) ? {ref, kind: 'tag', shortName} : null
   }
   return null
 }
@@ -31,9 +54,9 @@ export interface RefChange {
 export interface RefDiff {
   /** Refs that are new or whose commit moved — these get evaluated. */
   changed: RefChange[]
-  /** Refs gone from the state event — the row is dropped, no run. */
+  /** Live refs gone from the state event — tombstoned, no run. */
   deleted: string[]
-  /** Refs present and unchanged; kept so callers can reason about coverage. */
+  /** Refs present and unchanged (including a tombstone reappearing at its old commit). */
   unchanged: string[]
 }
 
@@ -41,13 +64,21 @@ export interface RefDiff {
  * Diffs a 30618's refs against the persisted `ref_state`.
  *
  * Both `refs/heads/*` and `refs/tags/*` participate. Anything else in the
- * event (`HEAD`, arbitrary tags) is ignored by `describeRef`.
+ * event (`HEAD`, arbitrary tags, malformed names) is ignored by `describeRef`.
+ *
+ * A ref absent from the event is *tombstoned*, not forgotten: its last commit
+ * stays in `known` with `deletedAt` set. Two maintainers whose 30618s cover
+ * different ref subsets otherwise make every ref outside the overlap flap
+ * between "deleted" and "new" on each alternate event, re-dispatching the
+ * same commit each time. With the tombstone, a ref reappearing at the commit
+ * we already built is unchanged; only a reappearance at a *new* commit is a
+ * push.
  */
 export function diffRefs(
   stateRefs: RepoStateRef[],
-  known: Array<{ref: string; commitId: string}>,
+  known: Array<{ref: string; commitId: string; deletedAt?: number | null}>,
 ): RefDiff {
-  const knownByRef = new Map(known.map(entry => [entry.ref, entry.commitId] as const))
+  const knownByRef = new Map(known.map(entry => [entry.ref, entry] as const))
   const seen = new Set<string>()
 
   const changed: RefChange[] = []
@@ -58,7 +89,8 @@ export function diffRefs(
     if (!descriptor) continue
     seen.add(stateRef.ref)
 
-    const previousCommitId = knownByRef.get(stateRef.ref) ?? null
+    const prior = knownByRef.get(stateRef.ref)
+    const previousCommitId = prior?.commitId ?? null
     if (previousCommitId === stateRef.commitId) {
       unchanged.push(stateRef.ref)
       continue
@@ -67,7 +99,11 @@ export function diffRefs(
     changed.push({descriptor, commitId: stateRef.commitId, previousCommitId})
   }
 
-  const deleted = [...knownByRef.keys()].filter(ref => !seen.has(ref))
+  // Only a *live* row transitions to deleted; an existing tombstone stays as
+  // it is rather than being reported again on every event.
+  const deleted = [...knownByRef.values()]
+    .filter(entry => !seen.has(entry.ref) && !entry.deletedAt)
+    .map(entry => entry.ref)
 
   return {changed, deleted, unchanged}
 }

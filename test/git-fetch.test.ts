@@ -8,6 +8,9 @@ import {fetchWorkflowTree, WorkflowTreeCache} from '../src/git/fetch.js'
 let repoDir: string
 /** A remote that drifted out of sync with the announced repo state. */
 let driftDir: string
+/** A remote that refuses SHA-in-want and carries an annotated tag. */
+let tagDir: string
+let tagPeeledCommit: string
 let secondCommit: string
 
 function git(args: string[], cwd = repoDir): string {
@@ -59,11 +62,24 @@ beforeAll(() => {
   )
   git(['add', '-A'], driftDir)
   git(['commit', '--quiet', '-m', 'drifted'], driftDir)
+
+  tagDir = mkdtempSync(join(tmpdir(), 'hive-ci-tag-'))
+  git(['init', '--quiet', '--initial-branch', 'main'], tagDir)
+  git(['config', 'uploadpack.allowAnySHA1InWant', 'false'], tagDir)
+  git(['config', 'uploadpack.allowReachableSHA1InWant', 'false'], tagDir)
+  git(['config', 'uploadpack.allowTipSHA1InWant', 'false'], tagDir)
+  mkdirSync(join(tagDir, '.github', 'workflows'), {recursive: true})
+  writeFileSync(join(tagDir, '.github', 'workflows', 'release.yml'), 'name: Release\non:\n  push:\n    tags: [v*]\njobs: {}\n')
+  git(['add', '-A'], tagDir)
+  git(['commit', '--quiet', '-m', 'tagged'], tagDir)
+  git(['tag', '-a', 'v1.0.0', '-m', 'v1.0.0'], tagDir)
+  tagPeeledCommit = git(['rev-parse', 'HEAD'], tagDir)
 })
 
 afterAll(() => {
   rmSync(repoDir, {recursive: true, force: true})
   rmSync(driftDir, {recursive: true, force: true})
+  rmSync(tagDir, {recursive: true, force: true})
 })
 
 describe('shallow fetch with commit verification', () => {
@@ -110,6 +126,32 @@ describe('shallow fetch with commit verification', () => {
       expect(tree).not.toBeNull()
       expect(tree!.get('.github/workflows/ci.yml')!.content).toContain('name: CI')
     }
+  })
+
+  it('peels an annotated tag reached through the ref-name fallback', async () => {
+    // A ref-name fetch of an annotated tag leaves FETCH_HEAD on the tag
+    // *object*, while the 30618 announced the peeled commit. Without peeling,
+    // the tip check rejects every annotated tag on a remote that refuses
+    // SHA-in-want. `file://` never refuses under protocol v2, so the fallback
+    // is forced explicitly.
+    const tree = await fetchWorkflowTree({
+      cloneUrls: [`file://${tagDir}`],
+      commitId: tagPeeledCommit,
+      refName: 'refs/tags/v1.0.0',
+      forceRefFallback: true,
+    })
+    expect(tree).not.toBeNull()
+    expect(tree!.get('.github/workflows/release.yml')!.content).toContain('name: Release')
+  })
+
+  it('still rejects a ref-name fallback whose peeled commit is not the announced one', async () => {
+    const tree = await fetchWorkflowTree({
+      cloneUrls: [`file://${tagDir}`],
+      commitId: '0'.repeat(40),
+      refName: 'refs/tags/v1.0.0',
+      forceRefFallback: true,
+    })
+    expect(tree).toBeNull()
   })
 
   it('returns null once every remote is exhausted', async () => {

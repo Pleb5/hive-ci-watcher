@@ -3,6 +3,7 @@ import {ApplesauceRelayPool} from '@contextvm/sdk/relay'
 import {PrivateKeySigner} from '@contextvm/sdk/signer'
 import {NostrServerTransport} from '@contextvm/sdk/transport'
 import {McpServer} from '@contextvm/mcp-sdk/server/mcp.js'
+import type {NostrEvent} from 'nostr-tools'
 import {z} from 'zod'
 import type {WatcherConfig} from '../config.js'
 import type {WatcherDb} from '../db/index.js'
@@ -30,7 +31,20 @@ interface ToolContext {
   identity: WatcherIdentity
   watcher: Watcher
   authorizer: Authorizer
+  /** Resolves the signed inner request event for a handled call, for replay checks. */
+  getRequestEvent?: (requestEventId: string) => NostrEvent | undefined
 }
+
+/**
+ * A request whose inner event is stamped outside this window is refused.
+ *
+ * The transport deduplicates by event id, but only in a bounded in-memory
+ * LRU, and a captured gift wrap re-published with the same bytes is otherwise
+ * indistinguishable from the original. Requiring the caller's own signed
+ * timestamp to be recent turns a captured `allow_pubkey` into a dead letter
+ * after five minutes instead of a re-grant after five thousand requests.
+ */
+export const REQUEST_MAX_AGE_SECONDS = 5 * 60
 
 type ToolResult = {content: Array<{type: 'text'; text: string}>; isError?: boolean}
 
@@ -50,6 +64,21 @@ function callerPubkey(extra: {_meta?: Record<string, unknown> | undefined}): str
 }
 
 /**
+ * Checks the inner event's `created_at` against the clock. Fails closed:
+ * without the event there is nothing to check, and a request we cannot date
+ * is treated like one that is stale.
+ */
+export function isFreshRequest(
+  event: {created_at: number; pubkey: string} | undefined,
+  caller: string | undefined,
+  nowSeconds = Math.floor(Date.now() / 1000),
+): boolean {
+  if (!event || !caller) return false
+  if (event.pubkey.toLowerCase() !== caller) return false
+  return Math.abs(nowSeconds - event.created_at) <= REQUEST_MAX_AGE_SECONDS
+}
+
+/**
  * Wraps a tool handler in its authorization check.
  *
  * Every refusal is the same flat string regardless of why — the daemon does
@@ -65,6 +94,18 @@ function guarded(
     if (!ctx.authorizer.authorize(caller, audience)) {
       log.warn('tool call refused', {audience, caller: caller?.slice(0, 12) ?? 'anonymous'})
       return fail(NOT_AUTHORIZED)
+    }
+
+    if (ctx.getRequestEvent) {
+      const requestEventId = extra?._meta?.requestEventId
+      const event = typeof requestEventId === 'string' ? ctx.getRequestEvent(requestEventId) : undefined
+      if (!isFreshRequest(event, caller)) {
+        log.warn('tool call refused as stale or undated', {
+          caller: caller?.slice(0, 12),
+          createdAt: event?.created_at ?? null,
+        })
+        return fail(NOT_AUTHORIZED)
+      }
     }
     try {
       return await handler(args ?? {}, caller!)
@@ -130,10 +171,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Remove a repo from the follow table, along with its ref state and schedules.',
       inputSchema: repoAddressShape,
     },
-    guarded(ctx, 'allowlisted', args => {
+    guarded(ctx, 'allowlisted', async args => {
       const {repoAddr} = resolveRepoAddress(args)
+      await watcher.unwatchRepo(repoAddr)
       const removed = db.unfollowRepo(repoAddr)
-      watcher.unwatchRepo(repoAddr)
       return ok({unfollowed: repoAddr, existed: removed})
     }),
   )
@@ -153,10 +194,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           default_branch: repo.defaultBranch,
           added_by: repo.addedBy,
           added_at: repo.addedAt,
+          seeded_at: repo.seededAt,
           refs: db.getRefStates(repo.repoAddr).map(state => ({
             ref: state.ref,
             commit: state.commitId,
             updated_at: state.updatedAt,
+            deleted_at: state.deletedAt,
           })),
           schedules: db.listSchedules(repo.repoAddr).map(schedule => ({
             workflow_path: schedule.workflowPath,
@@ -305,8 +348,6 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     {capabilities: {tools: {}}},
   )
 
-  registerTools(server, ctx)
-
   const relayPool = new ApplesauceRelayPool(ctx.watcher.relays.getRelayUrls())
   const transport = new NostrServerTransport({
     signer: new PrivateKeySigner(ctx.identity.secretKeyHex),
@@ -315,8 +356,10 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     giftWrapMode: GiftWrapMode.EPHEMERAL,
     isAnnouncedServer: true,
     // The caller's pubkey has to reach the tool handlers; the transport reads
-    // it off the decrypted inner event.
+    // it off the decrypted inner event. The request event id lets the guard
+    // fetch that same signed event and check its timestamp.
     injectClientPubkey: true,
+    injectRequestEventId: true,
     serverInfo: {
       name: 'hive-ci-watcher',
       about: 'Watches Nostr repositories and dispatches Hive CI runs on the owner’s behalf.',
@@ -326,6 +369,11 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
   // No custom watcher-announcement kind: this extra tag on the 11316 is what
   // makes `{kinds:[11316], '#t':['hive-ci-watcher']}` the discovery filter.
   transport.setAnnouncementExtraTags([['t', WATCHER_DISCOVERY_TAG]])
+
+  registerTools(server, {
+    ...ctx,
+    getRequestEvent: id => transport.getNostrRequestEvent(id),
+  })
 
   await server.connect(transport)
   log.info('contextvm server announced', {pubkey: ctx.identity.pubkey, tag: WATCHER_DISCOVERY_TAG})

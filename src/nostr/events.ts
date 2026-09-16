@@ -1,4 +1,5 @@
 import type {NostrEvent} from 'nostr-tools'
+import {describeRef} from '../triggers/refs.js'
 
 export const KIND_REPO_ANNOUNCEMENT = 30617
 export const KIND_REPO_STATE = 30618
@@ -75,12 +76,28 @@ export function parseRepoAnnouncement(event: NostrEvent): RepoAnnouncement | nul
     owner: event.pubkey,
     dTag,
     name: tagValue(event, 'name') || dTag,
-    cloneUrls: tagValues(event, 'clone'),
+    cloneUrls: tagValues(event, 'clone').map(url => url.trim()).filter(isAllowedCloneUrl),
     relays: tagValues(event, 'relays'),
     maintainers: [...maintainers],
     createdAt: event.created_at,
     event,
   }
+}
+
+/**
+ * Clone URLs come from a 30617 that any repo owner signs, and go straight to
+ * `git fetch`. Only network transports that need no credentials or agent
+ * are accepted: `file://` would let an announcement point the watcher at its
+ * own filesystem, `ssh://` hangs on host-key and agent prompts under a
+ * daemon, and `ext::` executes a command. URLs starting with `-` are refused
+ * so they can never be read as a git option.
+ */
+export function isAllowedCloneUrl(url: string): boolean {
+  const trimmed = url.trim()
+  if (!trimmed || trimmed.startsWith('-')) return false
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20]/.test(trimmed)) return false
+  return /^(https?|git):\/\/[^/]+\/.+/i.test(trimmed)
 }
 
 export interface RepoStateRef {
@@ -135,6 +152,7 @@ export function parseRepoState(event: NostrEvent, owner: string): RepoState | nu
     }
 
     if (!name.startsWith('refs/heads/') && !name.startsWith('refs/tags/')) continue
+    if (!describeRef(name)) continue
 
     const refValue = tag[1]
     if (!refValue || !COMMIT_RE.test(refValue)) continue

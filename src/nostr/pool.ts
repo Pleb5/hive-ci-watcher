@@ -9,6 +9,7 @@ interface SubscriptionDescriptor {
   id: string
   filters: Filter[]
   onEvent: (event: NostrEvent) => void
+  onEose?: () => void
 }
 
 export interface RelayHealth {
@@ -105,8 +106,13 @@ export class RelayManager {
    * because the 30618 filter is rebuilt every time an owner's maintainer set
    * changes, and the stale filter must go with it.
    */
-  async subscribe(id: string, filters: Filter[], onEvent: (event: NostrEvent) => void): Promise<void> {
-    const descriptor: SubscriptionDescriptor = {id, filters, onEvent}
+  async subscribe(
+    id: string,
+    filters: Filter[],
+    onEvent: (event: NostrEvent) => void,
+    onEose?: () => void,
+  ): Promise<void> {
+    const descriptor: SubscriptionDescriptor = {id, filters, onEvent, onEose}
     const existing = this.unsubscribers.get(id)
     this.descriptors.set(id, descriptor)
 
@@ -158,13 +164,17 @@ export class RelayManager {
   }
 
   private async attach(pool: ApplesauceRelayPool, descriptor: SubscriptionDescriptor): Promise<void> {
-    const unsubscribe = await pool.subscribe(descriptor.filters, event => {
-      try {
-        descriptor.onEvent(event)
-      } catch (err) {
-        log.error('subscription handler threw', {id: descriptor.id, error: errorMessage(err)})
-      }
-    })
+    const unsubscribe = await pool.subscribe(
+      descriptor.filters,
+      event => {
+        try {
+          descriptor.onEvent(event)
+        } catch (err) {
+          log.error('subscription handler threw', {id: descriptor.id, error: errorMessage(err)})
+        }
+      },
+      descriptor.onEose,
+    )
     this.unsubscribers.set(descriptor.id, unsubscribe)
   }
 }

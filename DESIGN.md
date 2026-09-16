@@ -50,8 +50,9 @@ State in SQLite (`better-sqlite3`). Remote control via ContextVM (MCP over Nostr
   commit       <commit>
   t            hive-ci
   ```
-- **5100** loom job — `p` runner, `e` runId, `cmd bash`, `args` (curl+bash of the
-  Blossom-hosted runner script), `env` tags, one `secret` tag
+- **5100** loom job — `p` runner, `e` runId, `cmd bash`, `args` (curl of the
+  Blossom-hosted runner script, **sha256-verified before it runs**), `env`
+  tags, one `secret` tag
   (`HIVE_CI_NSEC` = the ephemeral secret key, NIP-44 encrypted to the runner).
   `HIVE_CI_BRANCH` carries the branch *or* tag name — `git clone --branch`
   accepts either, so the existing runner script needs no change. The extra
@@ -86,9 +87,16 @@ Relay set = configured defaults (`wss://relay.budabit.club`, `wss://nos.lol`, �
 for publishing 5401/5100.
 
 Per followed repo: `{kinds:[30617], authors:[repoOwner], '#d':[d]}` for the
-announcement, then `{kinds:[30618], authors:[owner, ...maintainers], '#d':[d]}`
-for state — the second filter is rebuilt whenever the owner's 30617 changes its
-maintainer set. Globally: `{kinds:[10100]}` for runner ads.
+announcement, `{kinds:[5], authors:[repoOwner], '#a':[repoAddr]}` for its
+NIP-09 deletion (which suspends evaluation until a newer 30617 arrives), then
+`{kinds:[30618], authors:[owner, ...maintainers], '#d':[d]}` for state — the
+last filter is rebuilt whenever the owner's 30617 changes its maintainer set.
+Globally: `{kinds:[10100]}` for runner ads.
+
+**Startup order matters.** Relays replay the latest 30618 for every followed
+repo the moment we subscribe; if that lands before any 10100 has been seen the
+pool looks empty and every pending push is dropped. Repo evaluation is held
+until the 10100 subscription reaches EOSE (bounded at 10 s).
 
 The runner pool lives only in SQLite. It is set through owner-only CVM tools and
 is never published — nothing outside the watcher needs to read it.
@@ -99,7 +107,15 @@ is never published — nothing outside the watcher needs to read it.
    maintainers; authors outside the current maintainer set are dropped).
 2. Parse refs. Default branch from the `HEAD` tag.
 3. Diff both `refs/heads/*` and `refs/tags/*` against the `ref_state` table.
-   - ref deleted → drop the row, no run
+   Ref names are validated against git's own `check-ref-format` rules first;
+   anything git would refuse is dropped at parse time (it ends up in
+   `HIVE_CI_BRANCH`, which the runner script word-splits on the worker host).
+   - ref absent → **tombstone** the row (`deleted_at`), keep its commit, no run.
+     Two maintainers whose 30618s cover different ref subsets would otherwise
+     flap every non-overlapping ref between "deleted" and "new" on each
+     alternate event; with the tombstone a reappearance at the commit we
+     already built is unchanged, and only a reappearance at a new commit is
+     a push.
    - ref new or commit changed → evaluate
 4. **Workflow discovery** (see §4) for two trees:
    - default branch at its current state commit → *trigger source*
@@ -126,8 +142,18 @@ is never published — nothing outside the watcher needs to read it.
 7. A candidate that matched but does not exist in the pushed ref's tree is
    skipped: there is nothing for `act` to run.
 8. Dispatch one run per surviving workflow path (§5).
-9. Write the new commit into `ref_state` unconditionally. No retries, so a
-   dispatch failure is logged and dropped, not replayed.
+9. Write the new commit into `ref_state` **only for a complete evaluation**:
+   both trees fetched, and every matching workflow dispatched (or nothing
+   matched). A fetch miss, an empty runner pool or a publish failure leaves
+   the row untouched, so the next 30618 for the repo — or a relay replaying
+   this one — evaluates the ref again. There is still no retry *loop*; the
+   retry is whatever event arrives next. Without this a thirty-second git
+   outage skips a commit's CI forever with one warn line.
+
+**First sight seeds, never dispatches.** The first 30618 recorded for a follow
+writes every ref into `ref_state` and fires nothing (`followed_repos.seeded_at`).
+The refs already exist; nothing was pushed. Otherwise following a repo with
+200 tags fires 200 runs on sight, and so does every re-follow.
 
 Restart is safe: `ref_state` is durable, so a ref that moved while the daemon
 was down produces a run on the next 30618 it sees.
@@ -140,6 +166,9 @@ was down produces a run on the next 30618 it sees.
 - `schedules(repo_addr, workflow_path, cron, last_fired_at)`; a 60 s tick fires
   anything whose next occurrence after `last_fired_at` is now due, on the default
   branch at its current state commit.
+- **Floor of five minutes**, as GitHub. Enforced on the fire rate — a schedule
+  never fires within 5 min of its `last_fired_at` — which makes it exact for
+  any expression without having to reason about a cron's minimum interval.
 - **Missed fires coalesce into one.** A watcher down for a day with an hourly cron
   runs once on startup, then resumes its normal cadence — the anacron rule. A
   brand-new schedule seeds `last_fired_at = now`, so adding a nightly job does not
@@ -159,22 +188,41 @@ out of scope.
 
 Given a repo and a target commit:
 
-1. Try each `clone` tag from the 30617 in order. Plain git, no ngit.
-2. `git init` → `git remote add` → `git fetch --depth 1 origin <commit>`; if the
-   remote refuses SHA-in-want, fall back to `git fetch --depth 1 origin <branch>`.
-3. **Verify the fetched tip equals the expected commit.** Remotes drift out of
-   sync with the announced repo state; a mismatch means try the next `clone` tag.
-   This check is what makes step 2's branch-name fallback safe — a remote that
-   has moved past the announced commit is a miss, never a silent build of the
-   wrong tree. Never relax it.
+1. Try each `clone` tag from the 30617 in order. Plain git, no ngit. Only
+   `https://`, `http://` and `git://` are accepted: `file://` would let an
+   announcement point the watcher at its own filesystem, `ssh://` hangs on
+   host-key and agent prompts under a daemon, `ext::` executes a command.
+   `GIT_ALLOW_PROTOCOL` pins the same set on the git side regardless of what
+   a redirect claims.
+2. `git init` → `git remote add` → `git fetch --depth 1 --filter=blob:none
+   origin <commit>`; if the remote refuses SHA-in-want, fall back to the ref
+   name. `--depth 1` bounds history, not size — it still pulls every blob in
+   the commit's tree, and sparse checkout only decides what gets written
+   afterwards. The blob filter makes the fetch tree-only and the checkout
+   then pulls just the workflow blobs. Servers without partial clone ignore
+   the filter with a warning.
+3. **Verify the fetched tip equals the expected commit.** Compare
+   `FETCH_HEAD^{commit}`, not `FETCH_HEAD`: a ref-name fetch of an annotated
+   tag lands on the tag *object*, while the 30618 announced the peeled
+   commit. Remotes drift out of sync with the announced repo state; a
+   mismatch means try the next `clone` tag. This check is what makes step 2's
+   ref-name fallback safe — a remote that has moved past the announced commit
+   is a miss, never a silent build of the wrong tree. Never relax it.
 4. Sparse-checkout `.github/workflows/` and `.ngit/workflows/`. Both directories
    hold the same GitHub Actions YAML schema; the union is the workflow set, with
    `.github` winning on a path collision.
 5. All remotes exhausted → log and skip the evaluation. No run.
 
+Workflow filenames must match `[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml` (they become
+`HIVE_CI_WORKFLOW`, which the runner script word-splits into a `nak` tag), and a
+file over 512 KiB is skipped (YAML alias expansion is otherwise unbounded). At
+most four `git fetch` processes run at once across every repo.
+
 Results are cached by `(repo, commit)` so a push touching five refs doesn't
 refetch the default branch five times — and a tag pointing at a commit already
-fetched for a branch reuses that tree outright.
+fetched for a branch reuses that tree outright. Misses are never cached: a
+remote that is down now may be up on the next push, and a cached miss on the
+default branch would blank the trigger source for the life of the process.
 
 ---
 
@@ -207,6 +255,12 @@ fetched for a branch reuses that tree outright.
 
    Practically this means one upload per script version, ever; the steady-state
    cost of a dispatch is a single conditional HEAD.
+
+   The `args` verify the download against that same sha256 before executing
+   it. The URL *is* the hash — Blossom is content-addressed — but nothing
+   makes `curl` check that, and the script runs on the worker **host**,
+   outside act's container. A Blossom operator, a MITM or a DNS hijack
+   serving different bytes at the same path would otherwise own every runner.
 4. Publish 5401 → `runId`.
 5. NIP-44-encrypt the ephemeral secret key to the runner pubkey, publish 5100
    with the env tags and the single `HIVE_CI_NSEC` secret.
@@ -245,6 +299,17 @@ Authorization is by the caller's pubkey, taken from the decrypted inner event
 Unknown callers get a flat "not authorized" — the daemon does not disclose
 whether a pubkey exists in the allowlist.
 
+A request whose signed inner event is stamped more than five minutes from the
+daemon's clock gets the same refusal. The transport deduplicates by event id,
+but only in a bounded in-memory LRU, and a captured gift wrap re-published
+with the same bytes is otherwise indistinguishable from the original; the
+caller's own timestamp turns a captured `allow_pubkey` into a dead letter
+instead of a re-grant.
+
+`unfollow_repo` is open to every allowlisted requester, not just the one who
+followed — the allowlist is a high-trust set, and `added_by` is recorded for
+blame rather than enforced.
+
 The CLI (`hive-ci-watcher`) is a thin ContextVM client over these tools — every
 subcommand is one tool call.
 
@@ -253,12 +318,15 @@ subcommand is one tool call.
 ## 7. Storage & config
 
 ```sql
-followed_repos(repo_addr PK, repo_owner, d_tag, default_branch, added_by, added_at)
-ref_state     (repo_addr, ref, commit_id, updated_at, PK(repo_addr,ref))
+followed_repos(repo_addr PK, repo_owner, d_tag, default_branch, added_by, added_at,
+               seeded_at)   -- NULL until the first 30618 has been recorded
+ref_state     (repo_addr, ref, commit_id, updated_at, deleted_at, PK(repo_addr,ref))
               -- ref is the full name: refs/heads/main, refs/tags/v1.2.0
+              -- deleted_at set = tombstone; commit kept so a reappearance
+              -- at it is not a push
 schedules     (repo_addr, workflow_path, cron, last_fired_at, PK(repo_addr,workflow_path))
 runs          (run_id PK, repo_addr, ref, commit_id, workflow_path, runner_pubkey,
-               trigger, created_at)
+               trigger, created_at)   -- pruned to the newest 5000 hourly
 allowlist     (pubkey PK, added_at)
 runner_pool   (pubkey PK, added_at)   -- private, never published
 kv            (key PK, value)   -- round-robin cursor, cached runner-script
@@ -279,7 +347,30 @@ Plaintext nsec in env for v1; NIP-49 later.
 
 ---
 
-## 8. Deliberately deferred
+## 8. Trust model, stated plainly
+
+Trust is delegated in a chain and each hop is unbounded:
+
+- the **watcher owner** trusts every allowlisted requester as a near co-owner
+  — they may follow any repo, unfollow anyone's, and spend the freelist without
+  quota;
+- each **requester** trusts every owner of every repo they follow — that owner
+  controls the clone URLs the watcher fetches from, the relays it connects to
+  and publishes on, and (via workflows) the code that runs on the worker;
+- each **repo owner** trusts every maintainer they list, who can publish the
+  30618 that decides what gets built.
+
+None of this is enforced by the watcher beyond signature checks and the
+validations in §3–§5. That is a deliberate v1 choice: the allowlist is small
+and hand-picked, so the trust is real. If the allowlist ever grows past
+"people who could be handed the owner key", per-requester quotas at the first
+hop are the place to bound the whole chain.
+
+Repo owners cannot opt out of being CI'd by someone else's watcher. They do
+not have to pay attention to it either: a watcher they have not named in
+their 30620 is one whose runs a client need not show.
+
+## 9. Deliberately deferred
 
 - **`paths` / `paths-ignore` filters.** Needs a real diff between two commits,
   which a shallow single-commit fetch cannot give (so a tag push cannot be
@@ -298,7 +389,7 @@ Plaintext nsec in env for v1; NIP-49 later.
 
 ---
 
-## 9. Layout
+## 10. Layout
 
 ```
 hive-ci-watcher/
@@ -319,7 +410,7 @@ hive-ci-watcher/
 
 ---
 
-## 10. Nix
+## 11. Nix
 
 `flake.nix` ships three outputs:
 
@@ -337,7 +428,7 @@ hive-ci-watcher/
 
 ---
 
-## 11. Testing
+## 12. Testing
 
 Vitest, matching the extension. The trigger logic is the part that must not be
 wrong, so it is written as pure functions over plain data and tested directly:
@@ -348,9 +439,10 @@ wrong, so it is written as pure functions over plain data and tested directly:
   only at the pushed ref.
 - **Ref diffing** — new / moved / deleted / unchanged refs, annotated tags with a
   peeled commit, a 30618 from a demoted maintainer, an older `created_at` losing
-  to a newer one.
+  to a newer one, tombstoned refs reappearing at the old vs a new commit, the
+  first-sight seed, git ref-name validation.
 - **Cron** — next-occurrence maths, missed fires coalescing to one, a new
-  schedule not firing on sight, DST and UTC handling.
+  schedule not firing on sight, the five-minute floor, DST and UTC handling.
 - **Runner selection** — round-robin fairness across restarts, offline and
   unknown runners excluded, a *priced* runner still selected (pool membership
   asserts the freelist arrangement), empty pool.
@@ -359,9 +451,13 @@ wrong, so it is written as pure functions over plain data and tested directly:
   tag rather than send it empty, including for a runner whose ad carries a
   price.
 - **Authorization** — every tool against owner / allowlisted / unknown callers,
-  and caller identity read from the inner event rather than the gift wrap.
-- **Git fetch** — commit-mismatch rejection and remote fallback, against a
-  local fixture repo served over `file://`.
+  caller identity read from the inner event rather than the gift wrap, and the
+  request-freshness window failing closed.
+- **Git fetch** — commit-mismatch rejection and remote fallback, an annotated
+  tag through the ref-name fallback (peeled) and the same fallback rejected
+  when the peeled commit is wrong, clone-URL scheme filtering, all against
+  local fixture repos served over `file://`.
+- **Runner args** — the sha256 check sits between download and execution.
 
 `.github/workflows/test.yml` runs lint + typecheck + vitest. It is deliberately
 `act`-compatible, so the watcher can build itself through its own pipeline.

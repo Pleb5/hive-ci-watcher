@@ -5,7 +5,7 @@ import type {WatcherIdentity} from '../identity.js'
 import {createLogger, errorMessage} from '../log.js'
 import type {LoomWorker} from '../nostr/events.js'
 import type {RelayManager} from '../nostr/pool.js'
-import {buildRunnerArgs, resolveRunnerScriptUrl} from './blossom.js'
+import {buildRunnerArgs, resolveRunnerScriptUrl, sha256Hex} from './blossom.js'
 import {
   buildLoomJobEvent,
   buildRunEnv,
@@ -142,7 +142,7 @@ export async function dispatchRun(
       buildLoomJobEvent({
         runnerPubkey,
         runId,
-        args: buildRunnerArgs(scriptUrl),
+        args: buildRunnerArgs(scriptUrl, sha256Hex(WORKFLOW_RUNNER_SCRIPT)),
         env,
         encryptedNsec,
       }),

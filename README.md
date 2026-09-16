@@ -131,3 +131,11 @@ can build itself through its own pipeline.
 - a per-repo CI secret store; watcher-triggered runs carry only `HIVE_CI_NSEC`
 - dispatch retries, run supersession, concurrency caps
 - `pull_request` and `workflow_dispatch` triggers
+
+## Trust model
+
+Allowlisted requesters are trusted as near co-owners: any repo, unfollow
+anyone's, no quotas. Each repo they follow hands its owner control of the
+clone URLs the watcher fetches from and the relays it connects to. See
+DESIGN.md §8 before growing the allowlist beyond people you would hand the
+owner key to.

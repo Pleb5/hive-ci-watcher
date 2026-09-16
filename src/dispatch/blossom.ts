@@ -108,10 +108,24 @@ async function uploadRunnerScript(args: {
   throw new Error(`all Blossom servers failed:\n${errors.join('\n')}`)
 }
 
-/** The `args` a loom worker uses to fetch and execute the hosted script. */
-export function buildRunnerArgs(url: string): string[] {
+/**
+ * The `args` a loom worker uses to fetch and execute the hosted script.
+ *
+ * The download is verified against the script's sha256 before it runs. The
+ * URL already *is* the hash — Blossom is content-addressed — but nothing
+ * makes `curl` check that, so a Blossom operator, a MITM, or a DNS hijack
+ * serving different bytes at the same path would otherwise get code onto
+ * every worker host. `sha256sum` is in coreutils; `shasum` covers macOS
+ * workers.
+ */
+export function buildRunnerArgs(url: string, sha256: string): string[] {
+  if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error('runner script hash must be 64 hex chars')
+  const script = '/tmp/run-workflow.sh'
+  const verify =
+    `(command -v sha256sum >/dev/null && echo "${sha256}  ${script}" | sha256sum -c --status` +
+    ` || echo "${sha256}  ${script}" | shasum -a 256 -c --status)`
   return [
     '-c',
-    `curl -fsSL "${url}" -o /tmp/run-workflow.sh && chmod +x /tmp/run-workflow.sh && /tmp/run-workflow.sh`,
+    `curl -fsSL "${url}" -o ${script} && ${verify} && chmod +x ${script} && ${script}`,
   ]
 }

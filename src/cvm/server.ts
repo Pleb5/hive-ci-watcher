@@ -243,6 +243,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           seeded_at: repo.seededAt,
           relay_hints: repo.relayHints,
           announcement_probe: watcher.repoProbe(repo.repoAddr),
+          unparseable_workflows: watcher.unparseableWorkflows(repo.repoAddr),
           refs: db.getRefStates(repo.repoAddr).map(state => ({
             ref: state.ref,
             commit: state.commitId,

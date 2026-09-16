@@ -42,7 +42,7 @@ import {
 import {selectDueSchedules} from './triggers/cron.js'
 import {evaluatePush} from './triggers/push.js'
 import {diffRefs, selectRepoState, type RefDescriptor} from './triggers/refs.js'
-import {parseWorkflowTree, type ParsedWorkflow} from './triggers/workflow.js'
+import {parseWorkflowTree, type ParsedWorkflow, type WorkflowParseError} from './triggers/workflow.js'
 
 const log = createLogger('watcher')
 
@@ -183,6 +183,11 @@ export class Watcher {
   /** What the follow-time probe found, for `list_followed`. */
   repoProbe(repoAddr: string): RepoWatch['probe'] {
     return this.repos.get(repoAddr)?.probe ?? null
+  }
+
+  /** Workflow files the watcher could not parse at the repo's latest evaluated commit. */
+  unparseableWorkflows(repoAddr: string): Array<WorkflowParseError & {commit: string}> {
+    return this.unparseable.get(repoAddr) ?? []
   }
 
   /**
@@ -475,6 +480,7 @@ export class Watcher {
 
       if (completion === 'complete') {
         this.db.putRefState(repoAddr, change.descriptor.ref, change.commitId)
+        log.info('ref recorded', {repoAddr, ref: change.descriptor.ref, commit: change.commitId.slice(0, 12)})
       } else {
         log.warn('evaluation incomplete, leaving ref for retry', {
           repoAddr,
@@ -507,7 +513,15 @@ export class Watcher {
     })
 
     if (paths.length === 0) {
-      log.debug('no workflow matched', {repoAddr: args.repoAddr, ref: args.ref.ref})
+      // Info, not debug: "I pushed and nothing happened" is the question this
+      // line answers. Say what was considered and what was unreadable.
+      log.info('push matched no workflow', {
+        repoAddr: args.repoAddr,
+        ref: args.ref.ref,
+        commit: args.commitId.slice(0, 12),
+        candidates: args.defaultWorkflows.map(w => `${w.path}${w.push ? '' : ' (no on.push)'}`),
+        unparseable: this.unparseableWorkflows(args.repoAddr).map(e => e.path),
+      })
       return 'complete'
     }
 
@@ -551,6 +565,10 @@ export class Watcher {
 
   /** Why the last poll for a `(repo, commit)` ended without a tree. */
   private readonly lastMiss = new Map<string, 'aborted' | 'exhausted'>()
+  /** Workflows that failed to parse, per repo, from the most recent tree read; for `list_followed`. */
+  private readonly unparseable = new Map<string, Array<WorkflowParseError & {commit: string}>>()
+  /** `(repo, commit)` pairs whose parse errors have already been logged, to log each once. */
+  private readonly parseErrorsLogged = new Set<string>()
 
   /**
    * Fetches a tree, polling while the remote has not yet caught up with the
@@ -593,6 +611,15 @@ export class Watcher {
               nextInMs: info.delayMs,
               elapsedMs: info.elapsedMs,
             }),
+          info =>
+            log.info('workflow tree fetched', {
+              repoAddr: announcement.repoAddr,
+              ref: refName,
+              commit: commitId.slice(0, 12),
+              attempts: info.attempt,
+              elapsedMs: info.elapsedMs,
+              cloneUrl: info.cloneUrl,
+            }),
         )
         if (outcome.tree) this.lastMiss.delete(key)
         else this.lastMiss.set(key, outcome.reason)
@@ -619,7 +646,24 @@ export class Watcher {
       }
       return {workflows: [], fetched: false}
     }
-    return {workflows: parseWorkflowTree(tree), fetched: true}
+
+    const parsed = parseWorkflowTree(tree)
+    this.unparseable.set(
+      announcement.repoAddr,
+      parsed.errors.map(error => ({...error, commit: commitId})),
+    )
+    if (parsed.errors.length > 0 && !this.parseErrorsLogged.has(key)) {
+      this.parseErrorsLogged.add(key)
+      for (const error of parsed.errors) {
+        log.warn('workflow file does not parse and will never trigger', {
+          repoAddr: announcement.repoAddr,
+          commit: commitId.slice(0, 12),
+          path: error.path,
+          error: error.error,
+        })
+      }
+    }
+    return {workflows: parsed.workflows, fetched: true}
   }
 
   // ── schedule pipeline (§3.3) ──────────────────────────────────────────────

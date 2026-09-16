@@ -169,6 +169,12 @@ on and whether any is online.
    Globs match the short name (`main`, `v1.2.0`), `*` not crossing `/` and `**`
    crossing it, as GitHub does. **`paths` / `paths-ignore` ignored in v1** (no
    cheap diff from a shallow fetch — see §8).
+
+   A workflow file that does not parse never fires and never takes the
+   evaluation down — but it is logged (once per commit, with js-yaml's
+   line:column) and listed by `list_followed`, and a push that matches nothing
+   logs the candidates it considered. "I pushed and nothing happened" must be
+   answerable from the log alone.
 7. A candidate that matched but does not exist in the pushed ref's tree is
    skipped: there is nothing for `act` to run.
 8. Dispatch one run per surviving workflow path (§5).
@@ -338,7 +344,7 @@ Authorization is by the caller's pubkey, taken from the decrypted inner event
 |---|---|---|
 | `follow_repo` | owner, allowlisted | Add a repo to the follow table. Any repo — no maintainer check. Accepts a `30617:…` address or an **naddr**, whose relay hints are stored and subscribed; extra `relays` may be passed. |
 | `unfollow_repo` | owner, allowlisted | Remove it. |
-| `list_followed` | owner, allowlisted | Followed repos + per-ref last-seen commit, relay hints, and the follow-time announcement probe result. |
+| `list_followed` | owner, allowlisted | Followed repos + per-ref last-seen commit, relay hints, the follow-time announcement probe result, and any workflow files that failed to parse at the last evaluated commit (with the YAML error). |
 | `status` | owner, allowlisted | Uptime, per-relay state (connected, liveness, failures, last event, event count), runner pool, recent runs. |
 | `list_runners` | owner, allowlisted | Resolved pool: allowed ∩ online, with the round-robin cursor, each member's advertised pricing (reported, not gated) and `on_freelist` — verified against the worker's published 30000 set when it advertises one. |
 | `runners_add` | owner only | Add a runner pubkey to the pool. |

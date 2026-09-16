@@ -74,19 +74,40 @@ function parseSchedules(value: unknown): string[] {
   return crons
 }
 
+export interface WorkflowParseError {
+  path: string
+  /** js-yaml's message, first line — includes line:column when it has one. */
+  error: string
+}
+
+export type WorkflowParseResult = {workflow: ParsedWorkflow; error?: never} | {workflow?: never; error: WorkflowParseError}
+
 /**
- * Parses one workflow's trigger surface. Returns `null` when the YAML does not
- * parse or is not a mapping — an unreadable workflow simply never fires,
- * rather than taking the whole evaluation down with it.
+ * Parses one workflow's trigger surface, keeping the reason when it cannot.
+ * An unreadable workflow never fires — it must not take the evaluation down
+ * with it — but the reason has to reach the operator, or "my workflow never
+ * runs" is undiagnosable from outside.
  */
-export function parseWorkflow(path: string, content: string): ParsedWorkflow | null {
+export function parseWorkflowDetailed(path: string, content: string): WorkflowParseResult {
   let doc: unknown
   try {
     doc = yaml.load(content)
-  } catch {
-    return null
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return {error: {path, error: message.split('\n')[0] ?? message}}
   }
-  if (!doc || typeof doc !== 'object') return null
+  if (!doc || typeof doc !== 'object') {
+    return {error: {path, error: 'workflow is not a YAML mapping'}}
+  }
+  return {workflow: parseWorkflowDocument(path, doc)}
+}
+
+/** `parseWorkflowDetailed` without the reason. */
+export function parseWorkflow(path: string, content: string): ParsedWorkflow | null {
+  return parseWorkflowDetailed(path, content).workflow ?? null
+}
+
+function parseWorkflowDocument(path: string, doc: object): ParsedWorkflow {
 
   const name = typeof (doc as any).name === 'string' ? (doc as any).name : path
   const onSection = readOnSection(doc)
@@ -114,11 +135,16 @@ export function parseWorkflow(path: string, content: string): ParsedWorkflow | n
   return parsed
 }
 
-export function parseWorkflowTree(tree: Map<string, {path: string; content: string}>): ParsedWorkflow[] {
-  const parsed: ParsedWorkflow[] = []
+export function parseWorkflowTree(tree: Map<string, {path: string; content: string}>): {
+  workflows: ParsedWorkflow[]
+  errors: WorkflowParseError[]
+} {
+  const workflows: ParsedWorkflow[] = []
+  const errors: WorkflowParseError[] = []
   for (const file of tree.values()) {
-    const workflow = parseWorkflow(file.path, file.content)
-    if (workflow) parsed.push(workflow)
+    const result = parseWorkflowDetailed(file.path, file.content)
+    if (result.workflow) workflows.push(result.workflow)
+    else errors.push(result.error)
   }
-  return parsed
+  return {workflows, errors}
 }

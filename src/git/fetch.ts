@@ -334,6 +334,7 @@ export async function fetchWithRetry(
   policy: RetryPolicy,
   signal?: AbortSignal,
   onRetry?: (info: {attempt: number; delayMs: number; elapsedMs: number}) => void,
+  onFetched?: (info: {attempt: number; elapsedMs: number; cloneUrl: string}) => void,
 ): Promise<FetchRetryOutcome> {
   const started = Date.now()
   let delay = policy.initialDelayMs
@@ -344,7 +345,10 @@ export async function fetchWithRetry(
       // A probe hit followed by a fetch miss (the pack still landing, a
       // transient error) is just another miss: keep polling.
       const tree = await attempt.fetch(url)
-      if (tree) return {tree, reason: 'fetched'}
+      if (tree) {
+        onFetched?.({attempt: attemptNumber, elapsedMs: Date.now() - started, cloneUrl: url})
+        return {tree, reason: 'fetched'}
+      }
     }
     if (signal?.aborted) return {tree: null, reason: 'aborted'}
 

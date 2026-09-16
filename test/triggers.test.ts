@@ -169,3 +169,23 @@ describe('candidate selection', () => {
     expect(paths).toEqual([])
   })
 })
+
+describe('parse errors are kept, not swallowed', () => {
+  it('reports the yaml error with its position', async () => {
+    const {parseWorkflowDetailed, parseWorkflowTree} = await import('../src/triggers/workflow.js')
+    const bad = ['on: push', 'jobs:', '  deploy:', '    steps:', '      - run: echo "deploying (trigger: $X)"'].join('\n')
+    const result = parseWorkflowDetailed('.github/workflows/demo.yaml', bad)
+    expect(result.workflow).toBeUndefined()
+    expect(result.error).toMatchObject({path: '.github/workflows/demo.yaml'})
+    expect(result.error!.error).toMatch(/bad indentation|mapping/i)
+    expect(result.error!.error).toMatch(/\(5:\d+\)/)
+
+    const tree = new Map([
+      ['.github/workflows/demo.yaml', {path: '.github/workflows/demo.yaml', content: bad}],
+      ['.github/workflows/ok.yaml', {path: '.github/workflows/ok.yaml', content: 'on: push\njobs: {}\n'}],
+    ])
+    const parsed = parseWorkflowTree(tree)
+    expect(parsed.workflows.map(w => w.path)).toEqual(['.github/workflows/ok.yaml'])
+    expect(parsed.errors.map(e => e.path)).toEqual(['.github/workflows/demo.yaml'])
+  })
+})

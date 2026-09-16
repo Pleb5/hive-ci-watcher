@@ -99,7 +99,9 @@ pool looks empty and every pending push is dropped. Repo evaluation is held
 until the 10100 subscription reaches EOSE (bounded at 10 s).
 
 The runner pool lives only in SQLite. It is set through owner-only CVM tools and
-is never published — nothing outside the watcher needs to read it.
+is never published on Nostr. Allowlisted requesters can read it through
+`list_runners` — they are trusted enough to see which workers their runs land
+on and whether any is online.
 
 ### 3.2 Push
 
@@ -424,7 +426,10 @@ hive-ci-watcher/
   `blossomServers`, `databasePath`.
 - `devShells.default` — node, pnpm, git, sqlite, `act`, `nak`.
 
-`git` must be on the unit's `PATH`; §4 shells out to it.
+`git` must be on the unit's `PATH`; §4 shells out to it. The git child never
+sees `HIVE_CI_WATCHER_NSEC`: the daemon strips it from the subprocess
+environment, so a client-side bug reached through a hostile remote yields at
+most a shell, never the identity.
 
 ---
 

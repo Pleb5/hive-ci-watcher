@@ -50,23 +50,41 @@ export const MAX_CONCURRENT_FETCHES = 4
  */
 const WORKFLOW_FILENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.ya?ml$/
 
+/** Environment variables that must never reach a git subprocess. */
+const SECRET_ENV_KEYS = ['HIVE_CI_WATCHER_NSEC', 'HIVE_CI_WATCHER_CLI_NSEC'] as const
+
+/**
+ * Builds the environment for a `git` child.
+ *
+ * The remote is chosen by whichever repo owner a requester followed, and git
+ * spawns further helpers (`git-remote-https`, credential helpers) that inherit
+ * whatever we hand it. The watcher's secret key is in `process.env` because
+ * that is where the daemon read it from; nothing git does needs it, and a
+ * client-side bug reached through a hostile server should yield at most a
+ * shell, never the identity.
+ */
+export function gitEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {...base}
+  for (const key of SECRET_ENV_KEYS) delete env[key]
+
+  env.GIT_TERMINAL_PROMPT = '0'
+  env.GIT_ASKPASS = 'echo'
+  env.GIT_CONFIG_NOSYSTEM = '1'
+  env.GIT_LFS_SKIP_SMUDGE = '1'
+  // The clone URL is attacker-chosen (any repo owner's 30617). Pin the
+  // transports git may use regardless of what the URL claims, so a helper
+  // like `ext::` can never be reached through redirection or an unexpected
+  // scheme. `file` is included only for the test fixtures.
+  env.GIT_ALLOW_PROTOCOL = base.HIVE_CI_WATCHER_GIT_ALLOW_PROTOCOL ?? 'https:http:git:file'
+  return env
+}
+
 async function git(cwd: string, args: string[], timeoutMs: number): Promise<string> {
   const {stdout} = await exec('git', args, {
     cwd,
     timeout: timeoutMs,
     maxBuffer: 32 * 1024 * 1024,
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_ASKPASS: 'echo',
-      GIT_CONFIG_NOSYSTEM: '1',
-      GIT_LFS_SKIP_SMUDGE: '1',
-      // The clone URL is attacker-chosen (any repo owner's 30617). Pin the
-      // transports git may use regardless of what the URL claims, so a
-      // helper like `ext::` can never be reached through redirection or an
-      // unexpected scheme. `file` is included only for the test fixtures.
-      GIT_ALLOW_PROTOCOL: process.env.HIVE_CI_WATCHER_GIT_ALLOW_PROTOCOL ?? 'https:http:git:file',
-    },
+    env: gitEnvironment(),
   })
   return stdout
 }

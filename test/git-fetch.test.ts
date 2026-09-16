@@ -3,7 +3,7 @@ import {mkdtempSync, mkdirSync, rmSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
-import {fetchWorkflowTree, WorkflowTreeCache} from '../src/git/fetch.js'
+import {fetchWorkflowTree, gitEnvironment, WorkflowTreeCache} from '../src/git/fetch.js'
 
 let repoDir: string
 /** A remote that drifted out of sync with the announced repo state. */
@@ -161,6 +161,28 @@ describe('shallow fetch with commit verification', () => {
       refName: 'refs/heads/main',
     })
     expect(tree).toBeNull()
+  })
+})
+
+describe('git subprocess environment', () => {
+  it('never hands the watcher or CLI secret key to git', () => {
+    const env = gitEnvironment({
+      PATH: '/usr/bin',
+      HIVE_CI_WATCHER_NSEC: 'a'.repeat(64),
+      HIVE_CI_WATCHER_CLI_NSEC: 'b'.repeat(64),
+      HIVE_CI_WATCHER_OWNER_PUBKEY: 'c'.repeat(64),
+    })
+    expect(env.HIVE_CI_WATCHER_NSEC).toBeUndefined()
+    expect(env.HIVE_CI_WATCHER_CLI_NSEC).toBeUndefined()
+    expect(env.PATH).toBe('/usr/bin')
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0')
+    expect(env.GIT_ALLOW_PROTOCOL).toBe('https:http:git:file')
+  })
+
+  it('does not mutate the process environment', () => {
+    const base = {HIVE_CI_WATCHER_NSEC: 'x'}
+    gitEnvironment(base)
+    expect(base.HIVE_CI_WATCHER_NSEC).toBe('x')
   })
 })
 

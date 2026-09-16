@@ -12,7 +12,7 @@
   "main": "./dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/main.ts",
+    "dev": "HIVE_CI_WATCHER_KEY_FILE=\"${HIVE_CI_WATCHER_KEY_FILE:-.dev/watcher.key}\" HIVE_CI_WATCHER_DB=\"${HIVE_CI_WATCHER_DB:-.dev/watcher.db}\" tsx watch src/main.ts",
     "start": "node dist/main.js",
     "cli": "tsx src/cli/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",

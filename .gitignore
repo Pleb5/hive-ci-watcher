@@ -8,3 +8,4 @@ result-*
 *.db-shm
 .env
 .DS_Store
+.dev/

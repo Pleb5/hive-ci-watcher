@@ -138,9 +138,15 @@ via `LoadCredential`.
 ## Development
 
 ```sh
-pnpm dev        # tsx watch
+pnpm dev        # tsx watch; key and db under ./.dev (gitignored)
 pnpm verify     # lint + typecheck + test
 ```
+
+`pnpm dev` keeps a **persistent** identity in `.dev/watcher.key` (generated on
+the first run) and its database in `.dev/watcher.db`, so restarts during
+development keep the same pubkey — whitelist it once. Only
+`HIVE_CI_WATCHER_OWNER_PUBKEY` needs to be in the environment. Logs are
+pretty-printed on a TTY; `HIVE_CI_WATCHER_LOG_FORMAT=json` forces JSON.
 
 `.github/workflows/test.yml` is deliberately `act`-compatible, so the watcher
 can build itself through its own pipeline.

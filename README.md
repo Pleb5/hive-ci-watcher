@@ -123,6 +123,8 @@ Every 5100 the watcher publishes omits the `payment` tag entirely.
     enable = true;
     ownerPubkey = "npub1...";
     persistKey = true;   # keep a generated key in /var/lib/hive-ci-watcher
+    logLevel = "debug";      # watcher logger
+    sdkLogLevel = "warn";    # ContextVM / applesauce (pino); "trace" for every relay message
     # nsecFile = config.sops.secrets.hive-ci-watcher-nsec.path;  # or bring your own
   };
 }

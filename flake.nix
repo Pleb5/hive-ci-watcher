@@ -157,7 +157,16 @@
           logLevel = lib.mkOption {
             type = lib.types.enum ["debug" "info" "warn" "error"];
             default = "info";
-            description = "Daemon log level.";
+            description = "Daemon log level (the watcher's own logger).";
+          };
+
+          sdkLogLevel = lib.mkOption {
+            type = lib.types.enum ["trace" "debug" "info" "warn" "error" "silent"];
+            default = "warn";
+            description = ''
+              Log level for the ContextVM / applesauce SDK logger (pino, JSON
+              on stderr). `trace` shows every relay message and gift wrap.
+            '';
           };
         };
 
@@ -175,6 +184,7 @@
               HIVE_CI_WATCHER_RELAYS = lib.concatStringsSep "," cfg.relays;
               HIVE_CI_WATCHER_BLOSSOM_SERVERS = lib.concatStringsSep "," cfg.blossomServers;
               HIVE_CI_WATCHER_LOG_LEVEL = cfg.logLevel;
+              LOG_LEVEL = cfg.sdkLogLevel;
             };
 
             # §4 shells out to git, so it must be on the unit's PATH.

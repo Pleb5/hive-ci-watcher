@@ -9,7 +9,9 @@ import type {WatcherConfig} from '../config.js'
 import type {WatcherDb} from '../db/index.js'
 import type {WatcherIdentity} from '../identity.js'
 import {createLogger, errorMessage} from '../log.js'
-import {isFreeWorker, isWorkerOnline, parseRepoAddress, repoAddress} from '../nostr/events.js'
+import {nip19} from 'nostr-tools'
+import {normalizeRelays} from '../nostr/client.js'
+import {isFreeWorker, isWorkerOnline, KIND_REPO_ANNOUNCEMENT, parseRepoAddress, repoAddress} from '../nostr/events.js'
 import type {Watcher} from '../watcher.js'
 import {assertPubkey, Authorizer, NOT_AUTHORIZED, type ToolAudience} from './auth.js'
 
@@ -123,27 +125,65 @@ function guarded(
  * its 30617 form, since the announcement is the trust root and the only thing
  * the follow table keys on.
  */
-function resolveRepoAddress(args: {repo_addr?: string; repo_owner?: string; d_tag?: string}): {
+function resolveRepoAddress(args: {
+  repo_addr?: string
+  repo_owner?: string
+  d_tag?: string
+  relays?: string[]
+}): {
   repoAddr: string
   repoOwner: string
   dTag: string
+  relayHints: string[]
 } {
+  const explicitHints = Array.isArray(args.relays) ? args.relays.filter(r => typeof r === 'string') : []
+
   if (args.repo_addr) {
-    const parsed = parseRepoAddress(args.repo_addr.trim())
-    if (!parsed) throw new Error('repo_addr must be <kind>:<owner-pubkey-hex>:<identifier>')
-    return {repoAddr: repoAddress(parsed.owner, parsed.dTag), repoOwner: parsed.owner, dTag: parsed.dTag}
+    const raw = args.repo_addr.trim().replace(/^nostr:/, '')
+
+    // An naddr carries the relays the repo lives on. Those are the hints that
+    // make a repo findable when its owner's announcement is nowhere on our
+    // defaults and they publish no kind 10002.
+    if (raw.startsWith('naddr1')) {
+      const decoded = nip19.decode(raw)
+      if (decoded.type !== 'naddr') throw new Error('repo_addr decoded to a non-naddr entity')
+      const {kind, pubkey, identifier, relays} = decoded.data
+      if (kind !== KIND_REPO_ANNOUNCEMENT && kind !== 30618) {
+        throw new Error(`naddr kind ${kind} is not a repo announcement`)
+      }
+      if (!identifier) throw new Error('naddr has no identifier')
+      return {
+        repoAddr: repoAddress(pubkey, identifier),
+        repoOwner: pubkey,
+        dTag: identifier,
+        relayHints: normalizeRelays([...(relays ?? []), ...explicitHints]),
+      }
+    }
+
+    const parsed = parseRepoAddress(raw)
+    if (!parsed) throw new Error('repo_addr must be <kind>:<owner-pubkey-hex>:<identifier> or an naddr')
+    return {
+      repoAddr: repoAddress(parsed.owner, parsed.dTag),
+      repoOwner: parsed.owner,
+      dTag: parsed.dTag,
+      relayHints: normalizeRelays(explicitHints),
+    }
   }
 
   const repoOwner = assertPubkey(args.repo_owner, 'repo_owner')
   const dTag = (args.d_tag ?? '').trim()
   if (!dTag) throw new Error('d_tag is required when repo_addr is omitted')
-  return {repoAddr: repoAddress(repoOwner, dTag), repoOwner, dTag}
+  return {repoAddr: repoAddress(repoOwner, dTag), repoOwner, dTag, relayHints: normalizeRelays(explicitHints)}
 }
 
 const repoAddressShape = {
-  repo_addr: z.string().optional().describe('Full repo address, 30617:<owner-pubkey-hex>:<identifier>'),
+  repo_addr: z
+    .string()
+    .optional()
+    .describe('Full repo address, 30617:<owner-pubkey-hex>:<identifier>, or an naddr (relay hints are used)'),
   repo_owner: z.string().optional().describe('Repo owner pubkey (hex) — alternative to repo_addr'),
   d_tag: z.string().optional().describe('Repo identifier (the 30617 d tag) — alternative to repo_addr'),
+  relays: z.array(z.string()).optional().describe('Extra relay hints where the repo publishes'),
 }
 
 export function registerTools(server: McpServer, ctx: ToolContext): void {
@@ -157,11 +197,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       inputSchema: repoAddressShape,
     },
     guarded(ctx, 'allowlisted', async (args, caller) => {
-      const {repoAddr, repoOwner, dTag} = resolveRepoAddress(args)
-      db.followRepo({repoAddr, repoOwner, dTag, addedBy: caller})
-      await watcher.watchRepo(repoAddr, repoOwner, dTag)
-      log.info('repo followed', {repoAddr, by: caller.slice(0, 12)})
-      return ok({followed: repoAddr})
+      const {repoAddr, repoOwner, dTag, relayHints} = resolveRepoAddress(args)
+      db.followRepo({repoAddr, repoOwner, dTag, addedBy: caller, relayHints})
+      const stored = db.getFollowedRepo(repoAddr)
+      await watcher.watchRepo(repoAddr, repoOwner, dTag, stored?.relayHints ?? relayHints)
+      log.info('repo followed', {repoAddr, by: caller.slice(0, 12), hints: relayHints.length})
+      return ok({followed: repoAddr, relay_hints: stored?.relayHints ?? relayHints})
     }),
   )
 
@@ -195,6 +236,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           added_by: repo.addedBy,
           added_at: repo.addedAt,
           seeded_at: repo.seededAt,
+          relay_hints: repo.relayHints,
+          announcement_probe: watcher.repoProbe(repo.repoAddr),
           refs: db.getRefStates(repo.repoAddr).map(state => ({
             ref: state.ref,
             commit: state.commitId,
@@ -229,14 +272,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         'membership asserts an unpaid arrangement with the worker.',
       inputSchema: {},
     },
-    guarded(ctx, 'allowlisted', () => {
+    guarded(ctx, 'allowlisted', async () => {
       const workers = watcher.knownWorkers()
       const now = Date.now()
       const cursorRaw = db.getKv(CURSOR_KEY)
 
-      return ok({
-        cursor: cursorRaw === null ? 0 : Number.parseInt(cursorRaw, 10) || 0,
-        runners: db.listRunnerPool().map(entry => {
+      const runners = await Promise.all(
+        db.listRunnerPool().map(async entry => {
           const worker = workers.get(entry.pubkey)
           const online = !!worker && isWorkerOnline(worker, now)
           return {
@@ -249,12 +291,17 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             // its public rate, since a 10100 is one event for every reader.
             advertises_pricing: !!worker && !isFreeWorker(worker),
             pricing: worker?.pricing ?? null,
+            // Verified against the worker's published freelist set when it
+            // advertises one; null when it does not.
+            on_freelist: worker ? await watcher.freelistStatus(entry.pubkey) : null,
             queue_depth: worker?.currentQueueDepth ?? null,
             last_seen: worker?.lastSeen ?? null,
             eligible: online,
           }
         }),
-      })
+      )
+
+      return ok({cursor: cursorRaw === null ? 0 : Number.parseInt(cursorRaw, 10) || 0, runners})
     }),
   )
 
@@ -348,7 +395,10 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     {capabilities: {tools: {}}},
   )
 
-  const relayPool = new ApplesauceRelayPool(ctx.watcher.relays.getRelayUrls())
+  // The management surface lives on the configured defaults only. Relays
+  // learned from followed repos are for watching those repos, and a bad one
+  // must not be able to keep the CVM server from starting.
+  const relayPool = new ApplesauceRelayPool(ctx.config.relays)
   const transport = new NostrServerTransport({
     signer: new PrivateKeySigner(ctx.identity.secretKeyHex),
     relayHandler: relayPool,

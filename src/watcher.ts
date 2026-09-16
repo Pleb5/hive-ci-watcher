@@ -1,23 +1,37 @@
-import type {NostrEvent} from 'nostr-tools'
+import {groupPubkeysByRelay} from 'applesauce-core/helpers/relay-selection'
+import {getOutboxes} from 'applesauce-core/helpers/mailboxes'
+import {mergeRelaySets} from 'applesauce-core/helpers/relays'
+import {nip19} from 'nostr-tools'
+import {
+  combineLatest,
+  debounceTime,
+  distinctUntilChanged,
+  map,
+  of,
+  shareReplay,
+  switchMap,
+  type Observable,
+  type Subscription,
+} from 'rxjs'
 import type {WatcherConfig} from './config.js'
 import type {WatcherDb} from './db/index.js'
-import {dispatchRun, type DispatchOutcome} from './dispatch/submit.js'
+import {dispatchRun, type DispatchOutcome, type DispatchRequest} from './dispatch/submit.js'
 import {fetchWorkflowTree, WorkflowTreeCache, type WorkflowTree} from './git/fetch.js'
 import type {WatcherIdentity} from './identity.js'
 import {createLogger, errorMessage} from './log.js'
+import {NostrClient, normalizeRelays, type RelayReport} from './nostr/client.js'
 import {
   KIND_LOOM_WORKER,
   KIND_REPO_ANNOUNCEMENT,
   KIND_REPO_STATE,
   parseLoomWorker,
-  parseRepoAddress,
   parseRepoAnnouncement,
   parseRepoState,
+  tagValue,
   type LoomWorker,
   type RepoAnnouncement,
   type RepoState,
 } from './nostr/events.js'
-import {RelayManager} from './nostr/pool.js'
 import {selectDueSchedules} from './triggers/cron.js'
 import {evaluatePush} from './triggers/push.js'
 import {diffRefs, selectRepoState, type RefDescriptor} from './triggers/refs.js'
@@ -28,56 +42,60 @@ const log = createLogger('watcher')
 const KIND_DELETION = 5
 const SCHEDULE_TICK_MS = 60_000
 const RUNS_PRUNE_EVERY_TICKS = 60
-/** How long startup waits for the 10100 subscription's EOSE before evaluating repos. */
+/** Startup: how long to wait for every default relay to EOSE the 10100 request. */
 const WORKER_DISCOVERY_TIMEOUT_MS = 10_000
+/** Follow: how long to wait before saying "no announcement found anywhere". */
+const ANNOUNCEMENT_PROBE_TIMEOUT_MS = 8_000
+/** A 30618 burst (several maintainers, several relays) is evaluated once. */
+const EVALUATE_DEBOUNCE_MS = 250
+/** Hard ceiling on one dispatch so a stalled relay or Blossom server cannot wedge a repo's queue. */
+const DISPATCH_DEADLINE_MS = 120_000
 
 export interface WatcherStatus {
   pubkey: string
   startedAt: number
   uptimeSeconds: number
-  relays: ReturnType<RelayManager['health']>
+  relays: RelayReport[]
   followedRepos: number
   knownWorkers: number
   runnerPool: number
   recentRuns: ReturnType<WatcherDb['recentRuns']>
 }
 
-/**
- * Whether an evaluation got far enough to be recorded.
- *
- * `ref_state` is written only for a *complete* evaluation: the tree was
- * fetched and every matching workflow was either dispatched or found nothing
- * to run. A fetch miss, an empty runner pool or a publish failure leaves the
- * row untouched, so the next state event for the repo (or a relay replay of
- * this one) evaluates the ref again. Without that, a thirty-second git outage
- * or a restart racing worker discovery would skip a commit's CI forever.
- */
 type Completion = 'complete' | 'incomplete'
 
-export class Watcher {
-  readonly relays: RelayManager
+interface RepoWatch {
+  repoAddr: string
+  owner: string
+  dTag: string
+  subscriptions: Subscription[]
+  announcement$: Observable<RepoAnnouncement | null>
+  /** Set once the probe has run, so `list_followed` can say why a repo is idle. */
+  probe: {checkedAt: number; found: boolean; relays: string[]} | null
+}
 
-  private readonly announcements = new Map<string, RepoAnnouncement>()
-  /** Every 30618 seen per repo, keyed by author — the maintainer race is resolved at read time. */
-  private readonly repoStates = new Map<string, Map<string, RepoState>>()
-  private readonly workers = new Map<string, LoomWorker>()
+export class Watcher {
+  readonly nostr: NostrClient
+
+  private readonly repos = new Map<string, RepoWatch>()
+  private workers = new Map<string, LoomWorker>()
   private readonly trees = new WorkflowTreeCache()
   /** Serialises evaluation per repo so two 30618s cannot interleave a ref diff. */
   private readonly repoQueues = new Map<string, Promise<void>>()
+  private readonly internal: Subscription[] = []
 
   private scheduleTimer: NodeJS.Timeout | null = null
   private scheduleTicks = 0
+  private tickInProgress = false
   private startedAt = 0
   private running = false
-  /** Resolves once the first 10100 EOSE arrives (or the discovery timeout passes). */
-  private workersReady: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly config: WatcherConfig,
     private readonly db: WatcherDb,
     private readonly identity: WatcherIdentity,
   ) {
-    this.relays = new RelayManager(config.relays)
+    this.nostr = new NostrClient(config.relays)
   }
 
   async start(): Promise<void> {
@@ -85,34 +103,35 @@ export class Watcher {
     this.running = true
     this.startedAt = Math.floor(Date.now() / 1000)
 
-    await this.relays.start()
-
-    // Relays replay the latest 30618 for every followed repo the moment we
-    // subscribe. If that lands before any 10100 has been seen, the runner
-    // pool looks empty and every pending push would be dropped. Hold repo
-    // evaluation until worker discovery has reached EOSE (bounded, so a
-    // relay that never sends EOSE cannot stall startup).
-    let markReady!: () => void
-    this.workersReady = new Promise<void>(resolve => {
-      markReady = resolve
-    })
-    const discoveryTimer = setTimeout(() => {
-      log.warn('worker discovery timed out, evaluating repos anyway')
-      markReady()
-    }, WORKER_DISCOVERY_TIMEOUT_MS)
-
-    await this.relays.subscribe(
-      'workers',
-      [{kinds: [KIND_LOOM_WORKER]}],
-      event => this.onWorkerAd(event),
-      () => {
-        clearTimeout(discoveryTimer)
-        markReady()
-      },
+    // Worker map is a projection of the store: every 10100 we have ever
+    // heard, latest per pubkey, re-derived whenever one changes.
+    this.internal.push(
+      this.nostr.store.timeline({kinds: [KIND_LOOM_WORKER]}).subscribe(events => {
+        const next = new Map<string, LoomWorker>()
+        for (const event of events) {
+          const worker = parseLoomWorker(event)
+          if (worker) next.set(worker.pubkey, worker)
+        }
+        this.workers = next
+      }),
     )
 
+    // Relays replay the latest 30618 for every followed repo the moment we
+    // subscribe. Learn the runner pool first — wait for every default relay
+    // to EOSE the worker request, bounded — so the first evaluation does not
+    // see an empty pool.
+    const ads = await this.nostr.requestAll(
+      this.nostr.defaults,
+      {kinds: [KIND_LOOM_WORKER]},
+      WORKER_DISCOVERY_TIMEOUT_MS,
+      'workers:discovery',
+    )
+    log.info('worker discovery complete', {ads: ads.length, workers: this.workers.size})
+
+    this.internal.push(this.nostr.subscribe(this.nostr.defaults$, {kinds: [KIND_LOOM_WORKER]}, 'workers'))
+
     for (const repo of this.db.listFollowedRepos()) {
-      await this.watchRepo(repo.repoAddr, repo.repoOwner, repo.dTag)
+      await this.watchRepo(repo.repoAddr, repo.repoOwner, repo.dTag, repo.relayHints)
     }
 
     this.scheduleTimer = setInterval(() => {
@@ -121,15 +140,18 @@ export class Watcher {
       )
     }, SCHEDULE_TICK_MS)
 
-    log.info('watcher started', {pubkey: this.identity.pubkey, repos: this.announcements.size})
+    log.info('watcher started', {pubkey: this.identity.pubkey, repos: this.repos.size})
   }
 
   async stop(): Promise<void> {
     this.running = false
     if (this.scheduleTimer) clearInterval(this.scheduleTimer)
     this.scheduleTimer = null
+    for (const watch of this.repos.values()) for (const sub of watch.subscriptions) sub.unsubscribe()
+    this.repos.clear()
+    for (const sub of this.internal) sub.unsubscribe()
     await Promise.allSettled([...this.repoQueues.values()])
-    await this.relays.stop()
+    this.nostr.close()
   }
 
   status(): WatcherStatus {
@@ -137,7 +159,7 @@ export class Watcher {
       pubkey: this.identity.pubkey,
       startedAt: this.startedAt,
       uptimeSeconds: this.startedAt ? Math.floor(Date.now() / 1000) - this.startedAt : 0,
-      relays: this.relays.health(),
+      relays: this.nostr.report(),
       followedRepos: this.db.listFollowedRepos().length,
       knownWorkers: this.workers.size,
       runnerPool: this.db.listRunnerPool().length,
@@ -149,26 +171,156 @@ export class Watcher {
     return this.workers
   }
 
+  /** What the follow-time probe found, for `list_followed`. */
+  repoProbe(repoAddr: string): RepoWatch['probe'] {
+    return this.repos.get(repoAddr)?.probe ?? null
+  }
+
+  /**
+   * Whether the watcher pubkey is on a worker's published freelist.
+   *
+   * Some workers advertise `freelist_event` (an naddr to a kind 30000 follow
+   * set) on their 10100. Resolving it through the store loader follows the
+   * naddr's relay hint, so the set is fetched from wherever the worker put
+   * it. `null` when the worker publishes no such pointer.
+   */
+  async freelistStatus(workerPubkey: string): Promise<boolean | null> {
+    const ad = this.nostr.store.getReplaceable(KIND_LOOM_WORKER, workerPubkey)
+    const naddr = ad ? (tagValue(ad, 'freelist_event') ?? tagValue(ad, 'whitelist_event')) : undefined
+    if (!naddr) return null
+
+    let pointer: {kind: number; pubkey: string; identifier: string; relays?: string[]}
+    try {
+      const decoded = nip19.decode(naddr.replace(/^nostr:/, ''))
+      if (decoded.type !== 'naddr') return null
+      pointer = decoded.data
+    } catch {
+      return null
+    }
+
+    const set = await this.nostr.loadReplaceable(pointer)
+    if (!set) return null
+    return set.tags.some(tag => tag[0] === 'p' && tag[1]?.toLowerCase() === this.identity.pubkey)
+  }
+
   // ── follow management ─────────────────────────────────────────────────────
 
-  /** Called by the CVM `follow_repo` tool once the row exists. */
-  async watchRepo(repoAddr: string, repoOwner: string, dTag: string): Promise<void> {
-    await this.relays.subscribe(
-      `announcement:${repoAddr}`,
-      [{kinds: [KIND_REPO_ANNOUNCEMENT], authors: [repoOwner], '#d': [dTag]}],
-      event => this.onAnnouncement(repoAddr, event),
+  /**
+   * Wires one repo as a set of streams:
+   *
+   * - announcement relays = defaults ∪ follower's hints ∪ owner's NIP-65 outboxes
+   * - state relays, per maintainer = the above ∪ the 30617's `relays` ∪ that
+   *   maintainer's own outboxes — one REQ per relay, authors narrowed to the
+   *   maintainers known to publish there
+   *
+   * Every input is an observable; a maintainer added to the 30617, or a 10002
+   * arriving late, reshapes the REQs without tearing anything down.
+   */
+  async watchRepo(repoAddr: string, owner: string, dTag: string, hints: string[] = []): Promise<void> {
+    if (this.repos.has(repoAddr)) return
+
+    const store = this.nostr.store
+    const hintRelays = normalizeRelays(hints)
+    const subscriptions: Subscription[] = []
+
+    const announcementRelays$ = combineLatest([of(hintRelays), this.nostr.outboxes$(owner)]).pipe(
+      map(([h, outboxes]) => mergeRelaySets(h, outboxes)),
+      distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
     )
 
-    // NIP-09 deletion of the announcement by its owner: the repo is gone.
-    await this.relays.subscribe(
-      `deletion:${repoAddr}`,
-      [{kinds: [KIND_DELETION], authors: [repoOwner], '#a': [repoAddr]}],
-      event => this.onAnnouncementDeleted(repoAddr, event),
+    subscriptions.push(
+      this.nostr.subscribe(
+        announcementRelays$,
+        [
+          {kinds: [KIND_REPO_ANNOUNCEMENT], authors: [owner], '#d': [dTag]},
+          // NIP-09: the store's delete manager drops the 30617 when this lands.
+          {kinds: [KIND_DELETION], authors: [owner], '#a': [repoAddr]},
+        ],
+        `announcement:${repoAddr}`,
+      ),
     )
 
-    // Subscribe to state from the owner immediately. The filter is widened to
-    // the full maintainer set as soon as the owner's 30617 arrives.
-    await this.subscribeState(repoAddr, dTag, [repoOwner])
+    const announcement$ = store.replaceable(KIND_REPO_ANNOUNCEMENT, owner, dTag).pipe(
+      map(event => (event ? parseRepoAnnouncement(event) : null)),
+      shareReplay({bufferSize: 1, refCount: true}),
+    )
+
+    const maintainers$ = announcement$.pipe(
+      map(a => (a ? a.maintainers : [owner])),
+      distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
+    )
+    const repoRelays$ = announcement$.pipe(
+      map(a => normalizeRelays(a?.relays ?? [])),
+      distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
+    )
+
+    // relay → maintainers reachable there. Each maintainer's own outboxes are
+    // consulted (fetched lazily via the store loader when unknown), and every
+    // maintainer is also expected on the repo's relays and ours.
+    const outboxMap$ = combineLatest([maintainers$, repoRelays$, announcementRelays$, this.nostr.defaults$]).pipe(
+      switchMap(([maintainers, repoRelays, annRelays, defaults]) =>
+        combineLatest(
+          maintainers.map(pubkey =>
+            this.nostr.outboxes$(pubkey).pipe(
+              map(outboxes => ({
+                pubkey,
+                relays: this.nostr.liveness.filter(mergeRelaySets(defaults, annRelays, repoRelays, outboxes)),
+              })),
+            ),
+          ),
+        ),
+      ),
+      map(pointers => groupPubkeysByRelay(pointers)),
+    )
+
+    subscriptions.push(
+      this.nostr.subscribeOutbox(outboxMap$, {kinds: [KIND_REPO_STATE], '#d': [dTag]}, `state:${repoAddr}`),
+    )
+
+    // Evaluate whenever the announcement or any maintainer's state changes.
+    const states$ = maintainers$.pipe(
+      switchMap(maintainers => store.timeline({kinds: [KIND_REPO_STATE], authors: maintainers, '#d': [dTag]})),
+    )
+    subscriptions.push(
+      combineLatest([announcement$, states$])
+        .pipe(debounceTime(EVALUATE_DEBOUNCE_MS))
+        .subscribe(() => this.enqueue(repoAddr, () => this.evaluateRepo(repoAddr))),
+    )
+
+    const watch: RepoWatch = {repoAddr, owner, dTag, subscriptions, announcement$, probe: null}
+    this.repos.set(repoAddr, watch)
+
+    // Say so if the announcement is nowhere we can see. The live subscription
+    // stays up regardless — a relay may serve it later — but silence here is
+    // the failure mode an operator cannot otherwise diagnose.
+    void this.probeAnnouncement(watch, hintRelays).catch(err =>
+      log.warn('announcement probe failed', {repoAddr, error: errorMessage(err)}),
+    )
+  }
+
+  private async probeAnnouncement(watch: RepoWatch, hintRelays: string[]): Promise<void> {
+    // Give the owner's 10002 a moment to arrive so their outboxes are probed too.
+    await new Promise(resolve => setTimeout(resolve, 2_000))
+    const outboxes = await firstOutboxes(this.nostr, watch.owner)
+    const relays = normalizeRelays(mergeRelaySets(this.nostr.defaults, hintRelays, outboxes))
+
+    const found = await this.nostr.requestAll(
+      relays,
+      {kinds: [KIND_REPO_ANNOUNCEMENT], authors: [watch.owner], '#d': [watch.dTag]},
+      ANNOUNCEMENT_PROBE_TIMEOUT_MS,
+      `probe:${watch.repoAddr}`,
+    )
+    const present = found.length > 0 || !!this.nostr.store.getReplaceable(KIND_REPO_ANNOUNCEMENT, watch.owner, watch.dTag)
+    watch.probe = {checkedAt: Math.floor(Date.now() / 1000), found: present, relays}
+
+    if (!present) {
+      log.warn('repo announcement not found on any reachable relay', {
+        repoAddr: watch.repoAddr,
+        relays,
+        ownerOutboxes: outboxes.length,
+        hint: 'follow with an naddr carrying relay hints, or ask the owner to publish a kind 10002',
+      })
+    }
   }
 
   /**
@@ -177,114 +329,13 @@ export class Watcher {
    * re-follow skip its seed.
    */
   async unwatchRepo(repoAddr: string): Promise<void> {
-    this.relays.unsubscribe(`announcement:${repoAddr}`)
-    this.relays.unsubscribe(`deletion:${repoAddr}`)
-    this.relays.unsubscribe(`state:${repoAddr}`)
-    this.announcements.delete(repoAddr)
-    this.repoStates.delete(repoAddr)
+    const watch = this.repos.get(repoAddr)
+    if (watch) for (const sub of watch.subscriptions) sub.unsubscribe()
+    this.repos.delete(repoAddr)
     this.trees.invalidateRepo(repoAddr)
     const pending = this.repoQueues.get(repoAddr)
     if (pending) await pending.catch(() => undefined)
     this.repoQueues.delete(repoAddr)
-  }
-
-  private async subscribeState(repoAddr: string, dTag: string, authors: string[]): Promise<void> {
-    await this.relays.subscribe(
-      `state:${repoAddr}`,
-      [{kinds: [KIND_REPO_STATE], authors, '#d': [dTag]}],
-      event => this.onRepoState(repoAddr, event),
-    )
-  }
-
-  // ── event handlers ────────────────────────────────────────────────────────
-
-  private onWorkerAd(event: NostrEvent): void {
-    const worker = parseLoomWorker(event)
-    if (!worker) return
-    const existing = this.workers.get(worker.pubkey)
-    if (existing && existing.lastSeen >= worker.lastSeen) return
-    this.workers.set(worker.pubkey, worker)
-  }
-
-  private onAnnouncement(repoAddr: string, event: NostrEvent): void {
-    const announcement = parseRepoAnnouncement(event)
-    if (!announcement || announcement.repoAddr !== repoAddr) return
-
-    const previous = this.announcements.get(repoAddr)
-    if (previous && previous.createdAt >= announcement.createdAt) return
-
-    this.announcements.set(repoAddr, announcement)
-    // A tree fetched from the old `clone` list may not reflect the new one.
-    this.trees.invalidateRepo(repoAddr)
-
-    void this.onAnnouncementUpdated(repoAddr, announcement, previous).catch(err =>
-      log.error('announcement handling failed', {repoAddr, error: errorMessage(err)}),
-    )
-  }
-
-  private onAnnouncementDeleted(repoAddr: string, event: NostrEvent): void {
-    const current = this.announcements.get(repoAddr)
-    // A deletion older than the announcement we hold does not apply to it.
-    if (!current || event.created_at < current.createdAt) return
-    log.warn('repo announcement deleted by owner; suspending evaluation', {repoAddr})
-    this.announcements.delete(repoAddr)
-    this.trees.invalidateRepo(repoAddr)
-  }
-
-  private async onAnnouncementUpdated(
-    repoAddr: string,
-    announcement: RepoAnnouncement,
-    previous: RepoAnnouncement | undefined,
-  ): Promise<void> {
-    // Relay set = configured defaults ∪ every relay named by a followed repo.
-    await this.relays.setRelays([
-      ...this.config.relays,
-      ...[...this.announcements.values()].flatMap(entry => entry.relays),
-    ])
-
-    const maintainersChanged =
-      !previous ||
-      previous.maintainers.slice().sort().join(',') !==
-        announcement.maintainers.slice().sort().join(',')
-
-    if (maintainersChanged) {
-      // Rebuilt whenever the owner's 30617 changes its maintainer set: a
-      // maintainer dropped from the announcement stops being accepted from
-      // that moment on.
-      await this.subscribeState(repoAddr, announcement.dTag, announcement.maintainers)
-
-      const allowed = new Set(announcement.maintainers.map(pubkey => pubkey.toLowerCase()))
-      const states = this.repoStates.get(repoAddr)
-      if (states) {
-        for (const author of [...states.keys()]) {
-          if (!allowed.has(author.toLowerCase())) states.delete(author)
-        }
-      }
-    }
-
-    // A fresh announcement can change the clone list, which changes which
-    // workflows we would read. Re-evaluate whatever state we already hold.
-    this.enqueue(repoAddr, () => this.evaluateRepo(repoAddr))
-  }
-
-  private onRepoState(repoAddr: string, event: NostrEvent): void {
-    const parsed = parseRepoAddress(repoAddr)
-    if (!parsed) return
-
-    const state = parseRepoState(event, parsed.owner)
-    if (!state || state.repoAddr !== repoAddr) return
-
-    let states = this.repoStates.get(repoAddr)
-    if (!states) {
-      states = new Map()
-      this.repoStates.set(repoAddr, states)
-    }
-
-    const existing = states.get(state.author)
-    if (existing && existing.createdAt >= state.createdAt) return
-    states.set(state.author, state)
-
-    this.enqueue(repoAddr, () => this.evaluateRepo(repoAddr))
   }
 
   /**
@@ -293,10 +344,10 @@ export class Watcher {
    * everything the first already handled.
    */
   private enqueue(repoAddr: string, task: () => Promise<void>): void {
+    if (!this.repos.has(repoAddr)) return
     const previous = this.repoQueues.get(repoAddr) ?? Promise.resolve()
     const next = previous
       .catch(() => undefined)
-      .then(() => this.workersReady)
       .then(task)
       .catch(err => log.error('repo evaluation failed', {repoAddr, error: errorMessage(err)}))
     this.repoQueues.set(repoAddr, next)
@@ -304,17 +355,31 @@ export class Watcher {
 
   // ── push pipeline (§3.2) ──────────────────────────────────────────────────
 
+  private currentAnnouncement(watch: RepoWatch): RepoAnnouncement | null {
+    const event = this.nostr.store.getReplaceable(KIND_REPO_ANNOUNCEMENT, watch.owner, watch.dTag)
+    return event ? parseRepoAnnouncement(event) : null
+  }
+
+  private currentStates(watch: RepoWatch, maintainers: string[]): RepoState[] {
+    return this.nostr.store
+      .getTimeline({kinds: [KIND_REPO_STATE], authors: maintainers, '#d': [watch.dTag]})
+      .map(event => parseRepoState(event, watch.owner))
+      .filter((state): state is RepoState => state !== null)
+  }
+
   private async evaluateRepo(repoAddr: string): Promise<void> {
-    const announcement = this.announcements.get(repoAddr)
+    const watch = this.repos.get(repoAddr)
+    if (!watch) return
+
+    const announcement = this.currentAnnouncement(watch)
     if (!announcement) {
-      log.debug('no announcement yet, deferring evaluation', {repoAddr})
+      log.debug('no announcement in store, deferring evaluation', {repoAddr})
       return
     }
 
-    const candidates = [...(this.repoStates.get(repoAddr)?.values() ?? [])]
-    const state = selectRepoState(candidates, announcement.maintainers)
+    const state = selectRepoState(this.currentStates(watch, announcement.maintainers), announcement.maintainers)
     if (!state) {
-      log.debug('no acceptable repo state', {repoAddr, candidates: candidates.length})
+      log.debug('no acceptable repo state', {repoAddr})
       return
     }
 
@@ -324,8 +389,6 @@ export class Watcher {
     const defaultBranch = resolveDefaultBranch(state, followed.defaultBranch)
     if (defaultBranch !== followed.defaultBranch) this.db.setDefaultBranch(repoAddr, defaultBranch)
 
-    // Trigger source: the default branch at *its* current state commit. Read
-    // once per evaluation and shared across every changed ref.
     const defaultRefName = `refs/heads/${defaultBranch}`
     const defaultCommit = state.refs.find(entry => entry.ref === defaultRefName)?.commitId ?? null
     const defaultTree = defaultCommit
@@ -341,8 +404,6 @@ export class Watcher {
       )
     }
 
-    // First state ever seen for this follow: record every ref, dispatch
-    // nothing. The refs already exist; nothing was pushed.
     if (followed.seededAt === null) {
       this.db.seedRefStates(
         repoAddr,
@@ -389,9 +450,6 @@ export class Watcher {
     commitId: string
     repoAddr: string
   }): Promise<Completion> {
-    // Without the default branch's copy we cannot know which triggers apply;
-    // guessing from the pushed ref alone would let a push rewrite its own
-    // rules (§3.2 step 5).
     if (!args.defaultFetched) return 'incomplete'
 
     const pushed = await this.loadWorkflows(args.announcement, args.commitId, args.ref.ref)
@@ -408,9 +466,6 @@ export class Watcher {
       return 'complete'
     }
 
-    // No concurrency caps: a push to a ref whose previous run is still in
-    // flight fires anyway, and one 30618 moving a branch and adding a tag at
-    // the same commit produces two runs. GitHub behaves the same way.
     let completion: Completion = 'complete'
     for (const workflowPath of paths) {
       const outcome = await this.dispatch({
@@ -427,17 +482,26 @@ export class Watcher {
     return completion
   }
 
-  private dispatch(request: Parameters<typeof dispatchRun>[1]): Promise<DispatchOutcome> {
-    return dispatchRun(
-      {
-        config: this.config,
-        db: this.db,
-        identity: this.identity,
-        relays: this.relays,
-        workers: () => this.workers,
-      },
-      request,
-    )
+  private async dispatch(request: DispatchRequest): Promise<DispatchOutcome> {
+    const deps = {
+      config: this.config,
+      db: this.db,
+      identity: this.identity,
+      nostr: this.nostr,
+      workers: () => this.workers,
+    }
+    let timer: NodeJS.Timeout | undefined
+    const deadline = new Promise<DispatchOutcome>(resolve => {
+      timer = setTimeout(
+        () => resolve({status: 'failed', error: `dispatch exceeded ${DISPATCH_DEADLINE_MS} ms`}),
+        DISPATCH_DEADLINE_MS,
+      )
+    })
+    try {
+      return await Promise.race([dispatchRun(deps, request), deadline])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   private async loadWorkflows(
@@ -453,18 +517,10 @@ export class Watcher {
     let tree: WorkflowTree | null = null
     try {
       tree = await this.trees.get(announcement.repoAddr, commitId, () =>
-        fetchWorkflowTree({
-          cloneUrls: announcement.cloneUrls,
-          commitId,
-          refName,
-        }),
+        fetchWorkflowTree({cloneUrls: announcement.cloneUrls, commitId, refName}),
       )
     } catch (err) {
-      log.warn('workflow fetch threw', {
-        repoAddr: announcement.repoAddr,
-        commitId,
-        error: errorMessage(err),
-      })
+      log.warn('workflow fetch threw', {repoAddr: announcement.repoAddr, commitId, error: errorMessage(err)})
       return {workflows: [], fetched: false}
     }
 
@@ -475,46 +531,59 @@ export class Watcher {
   // ── schedule pipeline (§3.3) ──────────────────────────────────────────────
 
   async runScheduleTick(nowMs = Date.now()): Promise<void> {
-    this.scheduleTicks += 1
-    if (this.scheduleTicks % RUNS_PRUNE_EVERY_TICKS === 0) {
-      const pruned = this.db.pruneRuns()
-      if (pruned > 0) log.debug('pruned run history', {pruned})
+    // A tick stalled on a dispatch is not joined by the next one; it is
+    // skipped and logged, so a stall surfaces instead of piling up.
+    if (this.tickInProgress) {
+      log.warn('schedule tick still running, skipping this one')
+      return
     }
-
-    const due = selectDueSchedules(this.db.listSchedules(), nowMs)
-    if (due.length === 0) return
-
-    for (const entry of due) {
-      const {repoAddr, workflowPath} = entry.schedule
-      // Mark fired before dispatching. `last_fired_at = now` — not the
-      // occurrence — is what coalesces every missed fire into this one.
-      this.db.markScheduleFired(repoAddr, workflowPath, Math.floor(nowMs / 1000))
-
-      const announcement = this.announcements.get(repoAddr)
-      const followed = this.db.getFollowedRepo(repoAddr)
-      if (!announcement || !followed) continue
-
-      const defaultBranch = followed.defaultBranch ?? 'main'
-      const ref = `refs/heads/${defaultBranch}`
-      const commitId = this.db
-        .getRefStates(repoAddr)
-        .find(state => state.ref === ref && !state.deletedAt)?.commitId
-      if (!commitId) {
-        log.warn('scheduled run has no known default-branch commit', {repoAddr, ref})
-        continue
+    this.tickInProgress = true
+    try {
+      this.scheduleTicks += 1
+      if (this.scheduleTicks % RUNS_PRUNE_EVERY_TICKS === 0) {
+        const pruned = this.db.pruneRuns()
+        if (pruned > 0) log.debug('pruned run history', {pruned})
       }
 
-      await this.dispatch({
-        repoAddr,
-        workflowPath,
-        trigger: 'schedule',
-        ref,
-        branch: defaultBranch,
-        commitId,
-        repoRelays: announcement.relays,
-      })
+      const due = selectDueSchedules(this.db.listSchedules(), nowMs)
+      for (const entry of due) {
+        const {repoAddr, workflowPath} = entry.schedule
+        this.db.markScheduleFired(repoAddr, workflowPath, Math.floor(nowMs / 1000))
+
+        const watch = this.repos.get(repoAddr)
+        const announcement = watch ? this.currentAnnouncement(watch) : null
+        const followed = this.db.getFollowedRepo(repoAddr)
+        if (!announcement || !followed) continue
+
+        const defaultBranch = followed.defaultBranch ?? 'main'
+        const ref = `refs/heads/${defaultBranch}`
+        const commitId = this.db
+          .getRefStates(repoAddr)
+          .find(state => state.ref === ref && !state.deletedAt)?.commitId
+        if (!commitId) {
+          log.warn('scheduled run has no known default-branch commit', {repoAddr, ref})
+          continue
+        }
+
+        await this.dispatch({
+          repoAddr,
+          workflowPath,
+          trigger: 'schedule',
+          ref,
+          branch: defaultBranch,
+          commitId,
+          repoRelays: announcement.relays,
+        })
+      }
+    } finally {
+      this.tickInProgress = false
     }
   }
+}
+
+async function firstOutboxes(nostr: NostrClient, pubkey: string): Promise<string[]> {
+  const mailboxes = await nostr.loadReplaceable({kind: 10002, pubkey}, 4_000)
+  return mailboxes ? normalizeRelays(getOutboxes(mailboxes)) : []
 }
 
 /**
@@ -537,3 +606,4 @@ export function resolveDefaultBranch(state: RepoState, recorded: string | null):
   }
   return branches[0] ?? 'main'
 }
+

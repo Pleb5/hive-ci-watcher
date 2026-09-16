@@ -1,4 +1,7 @@
 import {nip19} from 'nostr-tools'
+import {normalizeRelays} from './nostr/relays.js'
+
+export {normalizeRelays}
 
 export const DEFAULT_RELAYS = [
   'wss://relay.budabit.club',
@@ -81,21 +84,4 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig 
       server => server.replace(/\/+$/, ''),
     ),
   }
-}
-
-/**
- * Relay URLs arrive from three places (env, 30617 `relays` tags, defaults) and
- * the same relay is routinely spelled with and without a trailing slash. The
- * subscription set is keyed by this normalised form so those do not open two
- * sockets to one relay.
- */
-export function normalizeRelays(urls: Iterable<string>): string[] {
-  const seen = new Set<string>()
-  for (const raw of urls) {
-    const trimmed = raw.trim()
-    if (!trimmed) continue
-    if (!/^wss?:\/\//i.test(trimmed)) continue
-    seen.add(trimmed.replace(/\/+$/, ''))
-  }
-  return [...seen].sort()
 }

@@ -47,8 +47,15 @@ hive-ci-watcher status
 hive-ci-watcher runners-add <loom-worker-pubkey>   # owner only
 hive-ci-watcher allow <requester-pubkey>           # owner only
 hive-ci-watcher follow 30617:<owner-pubkey>:<identifier>
-hive-ci-watcher list
+hive-ci-watcher follow naddr1...                    # relay hints in the naddr are used
+hive-ci-watcher follow 30617:<owner>:<id> wss://relay.example   # or pass hints explicitly
+hive-ci-watcher list                                # includes the announcement probe result
 ```
+
+If `list` shows `announcement_probe.found: false`, the repo's 30617 is on no
+relay the watcher can see. The watcher already consults the owner's NIP-65
+relay list; the remaining fix is to follow with an naddr carrying the right
+relay, or ask the owner to publish a kind 10002.
 
 `runners-add`, `runners-remove`, `allow`, `revoke` and `allowed` are owner-only.
 Everything else is open to the allowlist. Unknown callers get a flat

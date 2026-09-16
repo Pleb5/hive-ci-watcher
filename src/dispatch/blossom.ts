@@ -7,6 +7,8 @@ import {createLogger, errorMessage} from '../log.js'
 const log = createLogger('blossom')
 
 const CACHED_URL_KEY = 'runner_script_url'
+/** Per-server ceiling on the one-time runner-script upload. */
+const UPLOAD_TIMEOUT_MS = 30_000
 
 export function sha256Hex(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex')
@@ -94,6 +96,9 @@ async function uploadRunnerScript(args: {
         // Force auth from the start: some servers answer the SDK's existence
         // probe with 401, which would short-circuit before `onAuth` ever fires.
         auth: true,
+        // A stalled server must fail this dispatch, not block the repo's
+        // queue (and shutdown) forever.
+        timeout: UPLOAD_TIMEOUT_MS,
         onAuth: async (_server, sha256, authType) =>
           createUploadAuth(signer, sha256, {type: authType}),
       })

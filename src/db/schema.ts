@@ -12,7 +12,10 @@ CREATE TABLE IF NOT EXISTS followed_repos (
   -- NULL until the first 30618 has been recorded. That first state seeds
   -- ref_state without dispatching; otherwise following a repo with 200 tags
   -- would fire 200 runs on sight.
-  seeded_at      INTEGER
+  seeded_at      INTEGER,
+  -- JSON array of relay URLs the follower supplied (an naddr's hints).
+  -- Unioned into the announcement and state subscriptions for this repo.
+  relay_hints    TEXT NOT NULL DEFAULT '[]'
 );
 
 -- ref is the full name: refs/heads/main, refs/tags/v1.2.0

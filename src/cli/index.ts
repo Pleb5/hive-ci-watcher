@@ -14,8 +14,8 @@ import {errorMessage} from '../log.js'
 const COMMANDS: Record<string, {tool: string; usage: string; args: (rest: string[]) => any}> = {
   follow: {
     tool: 'follow_repo',
-    usage: 'follow <30617:owner:identifier>',
-    args: ([repoAddr]) => ({repo_addr: required(repoAddr, 'repo address')}),
+    usage: 'follow <30617:owner:identifier | naddr1…> [relay …]',
+    args: ([repoAddr, ...relays]) => ({repo_addr: required(repoAddr, 'repo address'), relays}),
   },
   unfollow: {
     tool: 'unfollow_repo',

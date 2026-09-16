@@ -266,3 +266,48 @@ describe('request freshness', () => {
     expect(isFreshRequest({created_at: now, pubkey: 'b'.repeat(64)}, caller, now)).toBe(false)
   })
 })
+
+describe('schema migration', () => {
+  it('adds columns missing from an older database', async () => {
+    const {default: Database} = await import('better-sqlite3')
+    const {mkdtempSync} = await import('node:fs')
+    const {tmpdir} = await import('node:os')
+    const {join} = await import('node:path')
+    const path = join(mkdtempSync(join(tmpdir(), 'hive-ci-db-')), 'old.db')
+
+    const old = new Database(path)
+    old.exec(`CREATE TABLE followed_repos (repo_addr TEXT PRIMARY KEY, repo_owner TEXT NOT NULL, d_tag TEXT NOT NULL,
+      default_branch TEXT, added_by TEXT NOT NULL, added_at INTEGER NOT NULL);
+      CREATE TABLE ref_state (repo_addr TEXT NOT NULL, ref TEXT NOT NULL, commit_id TEXT NOT NULL,
+      updated_at INTEGER NOT NULL, PRIMARY KEY (repo_addr, ref));
+      INSERT INTO followed_repos VALUES ('r', '${OWNER}', 'd', NULL, '${OWNER}', 1);
+      INSERT INTO ref_state VALUES ('r', 'refs/heads/main', '${COMMIT_A}', 1);`)
+    old.close()
+
+    const db = new WatcherDb(path)
+    const repo = db.getFollowedRepo('r')!
+    expect(repo.seededAt).toBeNull()
+    expect(repo.relayHints).toEqual([])
+    expect(db.getRefStates('r')[0]!.deletedAt).toBeNull()
+    db.close()
+  })
+})
+
+describe('relay url normalisation', () => {
+  it('drops onion, malformed and non-websocket entries', async () => {
+    const {normalizeRelays} = await import('../src/nostr/relays.js')
+    expect(
+      normalizeRelays([
+        'wss://nos.lol',
+        'wss://nos.lol/',
+        'ws://abc.onion/',
+        'wss://',
+        'wss://a b',
+        'https://not-a-relay.example',
+        'wss://relay.example.com:4443/path',
+        '',
+        null,
+      ]),
+    ).toEqual(['wss://nos.lol/', 'wss://relay.example.com:4443/path'])
+  })
+})

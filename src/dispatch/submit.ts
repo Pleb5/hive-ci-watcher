@@ -4,7 +4,7 @@ import type {WatcherDb} from '../db/index.js'
 import type {WatcherIdentity} from '../identity.js'
 import {createLogger, errorMessage} from '../log.js'
 import type {LoomWorker} from '../nostr/events.js'
-import type {RelayManager} from '../nostr/pool.js'
+import {normalizeRelays, type NostrClient} from '../nostr/client.js'
 import {buildRunnerArgs, resolveRunnerScriptUrl, sha256Hex} from './blossom.js'
 import {
   buildLoomJobEvent,
@@ -37,10 +37,22 @@ export interface DispatchDeps {
   config: WatcherConfig
   db: WatcherDb
   identity: WatcherIdentity
-  relays: RelayManager
+  nostr: NostrClient
   /** Latest 10100 per worker pubkey. */
   workers: () => Map<string, LoomWorker>
 }
+
+/**
+ * Where a run's 5401/5100 go: our defaults ∪ the repo's own relays. Workers
+ * advertise no relay hints on their 10100 (checked), so the defaults are the
+ * set they are assumed to listen on; the repo's relays are where its readers
+ * look for runs. Acceptance is required from at least two of them.
+ */
+export function publishRelaysFor(config: WatcherConfig, repoRelays: string[]): string[] {
+  return normalizeRelays([...config.relays, ...repoRelays])
+}
+
+const MIN_ACCEPTING_RELAYS = 2
 
 export type DispatchOutcome =
   | {status: 'dispatched'; runId: string; runnerPubkey: string}
@@ -78,7 +90,7 @@ export async function dispatchRun(
   deps: DispatchDeps,
   request: DispatchRequest,
 ): Promise<DispatchOutcome> {
-  const {config, db, identity, relays} = deps
+  const {config, db, identity, nostr} = deps
 
   const allowed = db.listRunnerPool().map(entry => entry.pubkey)
   const eligible = eligibleRunners({allowed, workers: deps.workers()})
@@ -109,7 +121,7 @@ export async function dispatchRun(
     const ephemeralSecretKey = generateSecretKey()
     const ephemeralPubkey = getPublicKey(ephemeralSecretKey)
 
-    const publishRelays = relays.getRelayUrls()
+    const publishRelays = publishRelaysFor(config, request.repoRelays)
     const runEvent = identity.sign(
       buildWorkflowRunEvent({
         repoAddr: request.repoAddr,
@@ -123,7 +135,7 @@ export async function dispatchRun(
       }),
     )
 
-    await relays.publish(runEvent)
+    const runPublish = await nostr.publish(publishRelays, runEvent, MIN_ACCEPTING_RELAYS)
     const runId = runEvent.id
 
     const env = buildRunEnv({
@@ -148,7 +160,7 @@ export async function dispatchRun(
       }),
     )
 
-    await relays.publish(jobEvent)
+    const jobPublish = await nostr.publish(publishRelays, jobEvent, MIN_ACCEPTING_RELAYS)
 
     db.recordRun({
       runId,
@@ -169,6 +181,7 @@ export async function dispatchRun(
       commit: request.commitId.slice(0, 12),
       runnerPubkey: runnerPubkey.slice(0, 12),
       trigger: request.trigger,
+      acceptedBy: {run: runPublish.accepted, job: jobPublish.accepted},
     })
 
     return {status: 'dispatched', runId, runnerPubkey}

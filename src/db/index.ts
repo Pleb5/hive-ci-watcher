@@ -11,6 +11,7 @@ export interface FollowedRepo {
   addedBy: string
   addedAt: number
   seededAt: number | null
+  relayHints: string[]
 }
 
 export interface RefState {
@@ -43,6 +44,16 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
 }
 
+function parseHints(raw: unknown): string[] {
+  if (typeof raw !== 'string') return []
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : []
+  } catch {
+    return []
+  }
+}
+
 export class WatcherDb {
   private readonly db: Database.Database
 
@@ -50,6 +61,23 @@ export class WatcherDb {
     if (path !== ':memory:') mkdirSync(dirname(path), {recursive: true})
     this.db = new Database(path)
     this.db.exec(SCHEMA_SQL)
+    this.migrate()
+  }
+
+  /**
+   * Additive migrations for databases created by an earlier schema.
+   * `CREATE TABLE IF NOT EXISTS` never alters an existing table, so columns
+   * added later are checked for and appended here.
+   */
+  private migrate(): void {
+    const ensureColumn = (table: string, column: string, definition: string) => {
+      const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{name: string}>
+      if (columns.some(entry => entry.name === column)) return
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+    }
+    ensureColumn('followed_repos', 'seeded_at', 'INTEGER')
+    ensureColumn('followed_repos', 'relay_hints', "TEXT NOT NULL DEFAULT '[]'")
+    ensureColumn('ref_state', 'deleted_at', 'INTEGER')
   }
 
   close(): void {
@@ -58,14 +86,23 @@ export class WatcherDb {
 
   // ── followed repos ──────────────────────────────────────────────────────
 
-  followRepo(repo: {repoAddr: string; repoOwner: string; dTag: string; addedBy: string}): void {
+  followRepo(repo: {
+    repoAddr: string
+    repoOwner: string
+    dTag: string
+    addedBy: string
+    relayHints?: string[]
+  }): void {
+    const hints = JSON.stringify(repo.relayHints ?? [])
+    // A re-follow with new hints keeps the row (and its seed) but widens the hints.
     this.db
       .prepare(
-        `INSERT INTO followed_repos (repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at)
-         VALUES (?, ?, ?, NULL, ?, ?, NULL)
-         ON CONFLICT(repo_addr) DO NOTHING`,
+        `INSERT INTO followed_repos (repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints)
+         VALUES (?, ?, ?, NULL, ?, ?, NULL, ?)
+         ON CONFLICT(repo_addr) DO UPDATE SET relay_hints = excluded.relay_hints
+           WHERE excluded.relay_hints <> '[]'`,
       )
-      .run(repo.repoAddr, repo.repoOwner, repo.dTag, repo.addedBy, nowSeconds())
+      .run(repo.repoAddr, repo.repoOwner, repo.dTag, repo.addedBy, nowSeconds(), hints)
   }
 
   /**
@@ -85,7 +122,7 @@ export class WatcherDb {
   listFollowedRepos(): FollowedRepo[] {
     return this.db
       .prepare(
-        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at
+        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints
          FROM followed_repos ORDER BY added_at ASC`,
       )
       .all()
@@ -97,13 +134,14 @@ export class WatcherDb {
         addedBy: row.added_by,
         addedAt: row.added_at,
         seededAt: row.seeded_at,
+        relayHints: parseHints(row.relay_hints),
       }))
   }
 
   getFollowedRepo(repoAddr: string): FollowedRepo | null {
     const row: any = this.db
       .prepare(
-        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at
+        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints
          FROM followed_repos WHERE repo_addr = ?`,
       )
       .get(repoAddr)
@@ -116,6 +154,7 @@ export class WatcherDb {
       addedBy: row.added_by,
       addedAt: row.added_at,
       seededAt: row.seeded_at,
+      relayHints: parseHints(row.relay_hints),
     }
   }
 

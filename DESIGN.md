@@ -34,7 +34,15 @@ State in SQLite (`better-sqlite3`). Remote control via ContextVM (MCP over Nostr
   commit as a third value; when present that is the commit to build.
   Newest `created_at` wins across maintainers; a maintainer dropped from the
   owner's 30617 stops being accepted from that moment on.
-- **10100** loom worker advertisement → online status, pricing, mints, queue depth.
+- **10100** loom worker advertisement → online status, pricing, mints, queue depth,
+  and — when the worker publishes one — a `freelist_event` naddr pointing at
+  its kind **30000** follow set of unpaid-allowed pubkeys.
+- **10002** NIP-65 relay lists for repo owners and maintainers → the outbox
+  relays their 30617/30618 are actually published to. Fetched lazily through
+  the store loader, falling back to the index relays (`purplepag.es`,
+  `index.hzrd149.com`, `relay.nostr.band`).
+- **5** NIP-09 deletion of a followed 30617 by its owner → the store drops the
+  announcement and evaluation suspends until a newer one arrives.
 
 ### Published
 
@@ -82,21 +90,38 @@ State in SQLite (`better-sqlite3`). Remote control via ContextVM (MCP over Nostr
 
 ### 3.1 Subscriptions
 
-Relay set = configured defaults (`wss://relay.budabit.club`, `wss://nos.lol`, …)
-∪ every relay named by the followed repos' 30617 announcements. Same set is used
-for publishing 5401/5100.
+One `applesauce-relay` `RelayPool` and one `applesauce-core` `EventStore`. Every
+event heard goes through `store.add`; the store is the source of truth for the
+latest 30617 per repo, the latest 30618 per maintainer and the latest 10100 per
+worker, and it applies kind-5 deletions itself. Relay sets and filters are
+**streams** — `pool.subscription(relays$, filters$)` adds and removes REQs as
+either changes; nothing is torn down wholesale when a maintainer is added or a
+10002 arrives late.
 
-Per followed repo: `{kinds:[30617], authors:[repoOwner], '#d':[d]}` for the
-announcement, `{kinds:[5], authors:[repoOwner], '#a':[repoAddr]}` for its
-NIP-09 deletion (which suspends evaluation until a newer 30617 arrives), then
-`{kinds:[30618], authors:[owner, ...maintainers], '#d':[d]}` for state — the
-last filter is rebuilt whenever the owner's 30617 changes its maintainer set.
-Globally: `{kinds:[10100]}` for runner ads.
+Per-relay liveness (`enablePing`) reconnects a relay that stops answering on
+its own. `RelayLiveness` tracks failures and backs off dead relays;
+`ignoreUnhealthyRelays` drops them from every relay stream, so a dead relay in
+someone's 30617 costs nothing.
+
+Relay sets, per followed repo:
+
+- **announcement**: defaults ∪ the follower's relay hints (an naddr's) ∪ the
+  owner's NIP-65 outboxes.
+- **state**, per maintainer: the above ∪ the 30617's `relays` ∪ that
+  maintainer's own outboxes — via `pool.outboxSubscription`, one REQ per relay
+  with `authors` narrowed to the maintainers known to publish there.
+
+At follow time a bounded one-shot probe asks every reachable relay for the
+30617 and records whether it was found; `list_followed` reports the result, so
+"followed but nothing ever happens" has a visible reason.
+
+Globally: `{kinds:[10100]}` on the defaults for runner ads.
 
 **Startup order matters.** Relays replay the latest 30618 for every followed
 repo the moment we subscribe; if that lands before any 10100 has been seen the
-pool looks empty and every pending push is dropped. Repo evaluation is held
-until the 10100 subscription reaches EOSE (bounded at 10 s).
+pool looks empty and every pending push is dropped. Startup first runs a
+one-shot 10100 request that completes when every default relay has EOSE'd
+(bounded at 10 s), and only then wires the repos.
 
 The runner pool lives only in SQLite. It is set through owner-only CVM tools and
 is never published on Nostr. Allowlisted requesters can read it through
@@ -256,16 +281,22 @@ default branch would blank the trigger source for the life of the process.
    fails the job on the runner instead of here.
 
    Practically this means one upload per script version, ever; the steady-state
-   cost of a dispatch is a single conditional HEAD.
+   cost of a dispatch is a single conditional HEAD. The upload itself is
+   bounded (30 s per server) and the whole dispatch has a 120 s deadline, so a
+   stalled server fails the run rather than wedging the repo's queue.
 
    The `args` verify the download against that same sha256 before executing
    it. The URL *is* the hash — Blossom is content-addressed — but nothing
    makes `curl` check that, and the script runs on the worker **host**,
    outside act's container. A Blossom operator, a MITM or a DNS hijack
    serving different bytes at the same path would otherwise own every runner.
-4. Publish 5401 → `runId`.
+4. Publish 5401 → `runId`. Target = defaults ∪ the repo's 30617 `relays`.
+   **Acceptance from at least two relays is required** (or all, when fewer are
+   healthy); one relay's OK is not delivery, since workers listen on the
+   defaults and readers on the repo's relays. Fewer accepts = the dispatch
+   failed and the ref is left for retry.
 5. NIP-44-encrypt the ephemeral secret key to the runner pubkey, publish 5100
-   with the env tags and the single `HIVE_CI_NSEC` secret.
+   with the env tags and the single `HIVE_CI_NSEC` secret, same rule.
 6. Record the run in `runs`.
 
 **No user secrets.** Watcher-triggered runs carry only `HIVE_CI_NSEC`. A
@@ -287,11 +318,11 @@ Authorization is by the caller's pubkey, taken from the decrypted inner event
 
 | Tool | Who | Effect |
 |---|---|---|
-| `follow_repo` | owner, allowlisted | Add a repo to the follow table. Any repo — no maintainer check. |
+| `follow_repo` | owner, allowlisted | Add a repo to the follow table. Any repo — no maintainer check. Accepts a `30617:…` address or an **naddr**, whose relay hints are stored and subscribed; extra `relays` may be passed. |
 | `unfollow_repo` | owner, allowlisted | Remove it. |
-| `list_followed` | owner, allowlisted | Followed repos + per-ref last-seen commit. |
-| `status` | owner, allowlisted | Uptime, relay health, runner pool, recent runs. |
-| `list_runners` | owner, allowlisted | Resolved pool: allowed ∩ online, with the round-robin cursor and each member's advertised pricing (reported, not gated). |
+| `list_followed` | owner, allowlisted | Followed repos + per-ref last-seen commit, relay hints, and the follow-time announcement probe result. |
+| `status` | owner, allowlisted | Uptime, per-relay state (connected, liveness, failures, last event, event count), runner pool, recent runs. |
+| `list_runners` | owner, allowlisted | Resolved pool: allowed ∩ online, with the round-robin cursor, each member's advertised pricing (reported, not gated) and `on_freelist` — verified against the worker's published 30000 set when it advertises one. |
 | `runners_add` | owner only | Add a runner pubkey to the pool. |
 | `runners_remove` | owner only | Remove one. |
 | `allow_pubkey` | owner only | Add a requester to the allowlist. |
@@ -321,7 +352,8 @@ subcommand is one tool call.
 
 ```sql
 followed_repos(repo_addr PK, repo_owner, d_tag, default_branch, added_by, added_at,
-               seeded_at)   -- NULL until the first 30618 has been recorded
+               seeded_at,   -- NULL until the first 30618 has been recorded
+               relay_hints) -- JSON array from the follower's naddr / relays arg
 ref_state     (repo_addr, ref, commit_id, updated_at, deleted_at, PK(repo_addr,ref))
               -- ref is the full name: refs/heads/main, refs/tags/v1.2.0
               -- deleted_at set = tombstone; commit kept so a reappearance
@@ -463,6 +495,9 @@ wrong, so it is written as pure functions over plain data and tested directly:
   when the peeled commit is wrong, clone-URL scheme filtering, all against
   local fixture repos served over `file://`.
 - **Runner args** — the sha256 check sits between download and execution.
+- **Relay URLs** — onion, malformed and non-websocket entries dropped before
+  they can reach the pool.
+- **Schema migration** — an older database gains the added columns on open.
 
 `.github/workflows/test.yml` runs lint + typecheck + vitest. It is deliberately
 `act`-compatible, so the watcher can build itself through its own pipeline.

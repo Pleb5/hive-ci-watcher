@@ -25,8 +25,9 @@
   "dependencies": {
     "@contextvm/mcp-sdk": "^1.30.0",
     "@contextvm/sdk": "^0.13.14",
-    "applesauce-core": "^5.2.0",
-    "applesauce-relay": "^5.2.0",
+    "applesauce-core": "^6.2.0",
+    "applesauce-loaders": "^6.2.0",
+    "applesauce-relay": "^6.2.1",
     "better-sqlite3": "^11.8.0",
     "blossom-client-sdk": "^5.0.0",
     "cron-parser": "^4.9.0",

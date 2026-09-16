@@ -241,7 +241,18 @@ Given a repo and a target commit:
 4. Sparse-checkout `.github/workflows/` and `.ngit/workflows/`. Both directories
    hold the same GitHub Actions YAML schema; the union is the workflow set, with
    `.github` winning on a path collision.
-5. All remotes exhausted → log and skip the evaluation. No run.
+5. All remotes exhausted → **poll**. A repo's state event routinely arrives
+   before its objects — ngit publishes the 30618, then uploads to the grasp
+   server — so a miss right after a push is expected, not final. Retry with
+   backoff (5 s doubling to 30 s) for `HIVE_CI_WATCHER_FETCH_RETRY_WINDOW`
+   (default 10 min); every attempt re-checks the announced commit. Only when
+   the window closes is the evaluation left incomplete.
+
+   **A newer state event supersedes the poll.** Each repo has one evaluation
+   in flight; enqueuing another fires its abort signal, the poll stops between
+   attempts (never mid-`git`), and the new evaluation starts from the latest
+   state. A ref that moved twice before its objects landed is built once, at
+   the newer commit. Dispatch itself is never interrupted.
 
 Workflow filenames must match `[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml` (they become
 `HIVE_CI_WORKFLOW`, which the runner script word-splits into a `nak` tag), and a
@@ -379,6 +390,7 @@ HIVE_CI_WATCHER_OWNER_PUBKEY     required
 HIVE_CI_WATCHER_DB               default ./watcher.db
 HIVE_CI_WATCHER_RELAYS           comma-separated defaults
 HIVE_CI_WATCHER_BLOSSOM_SERVERS  comma-separated, ordered
+HIVE_CI_WATCHER_FETCH_RETRY_WINDOW  seconds to keep polling a lagging remote, default 600
 ```
 
 When given, plaintext nsec in env for v1; NIP-49 later.

@@ -246,6 +246,76 @@ async function fetchWorkflowTreeUnbounded(options: FetchOptions): Promise<Workfl
   return null
 }
 
+export interface RetryPolicy {
+  /** Total time to keep trying, from the first attempt. */
+  windowMs: number
+  initialDelayMs: number
+  maxDelayMs: number
+}
+
+export const DEFAULT_RETRY_POLICY: RetryPolicy = {
+  windowMs: 10 * 60_000,
+  initialDelayMs: 5_000,
+  maxDelayMs: 30_000,
+}
+
+/**
+ * Retries a fetch until it yields a tree, the window closes, or the caller
+ * aborts.
+ *
+ * A repo's state event routinely arrives *before* its objects: ngit publishes
+ * the 30618, then uploads to the grasp server. Fetching in that gap sees the
+ * previous tip and fails the commit check — correctly, but it is not a
+ * failure to give up on. Poll with backoff; the announced commit is the
+ * thing that decides, so every attempt re-checks it.
+ *
+ * `signal` is the caller's supersession signal: when a newer state event
+ * moves the ref again there is no point finishing this poll, so it stops
+ * between attempts (never mid-`git`).
+ */
+export type FetchRetryOutcome =
+  | {tree: WorkflowTree; reason: 'fetched'}
+  | {tree: null; reason: 'aborted' | 'exhausted'}
+
+export async function fetchWithRetry(
+  attempt: () => Promise<WorkflowTree | null>,
+  policy: RetryPolicy,
+  signal?: AbortSignal,
+  onRetry?: (info: {attempt: number; delayMs: number; elapsedMs: number}) => void,
+): Promise<FetchRetryOutcome> {
+  const started = Date.now()
+  let delay = policy.initialDelayMs
+  for (let attemptNumber = 1; ; attemptNumber += 1) {
+    if (signal?.aborted) return {tree: null, reason: 'aborted'}
+    const tree = await attempt()
+    if (tree) return {tree, reason: 'fetched'}
+    if (signal?.aborted) return {tree: null, reason: 'aborted'}
+
+    const elapsedMs = Date.now() - started
+    if (elapsedMs + delay > policy.windowMs) return {tree: null, reason: 'exhausted'}
+
+    onRetry?.({attempt: attemptNumber, delayMs: delay, elapsedMs})
+    if (await sleepUnlessAborted(delay, signal)) return {tree: null, reason: 'aborted'}
+    delay = Math.min(delay * 2, policy.maxDelayMs)
+  }
+}
+
+/** Resolves `true` if the signal fired before the delay elapsed. */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<boolean> {
+  return new Promise(resolve => {
+    if (signal?.aborted) return resolve(true)
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve(false)
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    signal?.addEventListener('abort', onAbort, {once: true})
+  })
+}
+
 /**
  * Caches trees by `(repo, commit)` so a push touching five refs does not
  * refetch the default branch five times — and a tag pointing at a commit

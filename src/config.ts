@@ -45,6 +45,11 @@ export interface WatcherConfig {
   cvmRelays: string[]
   /** Ordered; the first server that answers wins. */
   blossomServers: string[]
+  /**
+   * How long to keep polling a remote that has not yet caught up with an
+   * announced commit, in ms. State events routinely precede object uploads.
+   */
+  fetchRetryWindowMs: number
 }
 
 const HEX64 = /^[0-9a-f]{64}$/i
@@ -135,5 +140,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig 
     blossomServers: splitList(env.HIVE_CI_WATCHER_BLOSSOM_SERVERS, DEFAULT_BLOSSOM_SERVERS).map(
       server => server.replace(/\/+$/, ''),
     ),
+    fetchRetryWindowMs: parseSeconds(env.HIVE_CI_WATCHER_FETCH_RETRY_WINDOW, 600) * 1000,
   }
+}
+
+function parseSeconds(raw: string | undefined, fallback: number): number {
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }

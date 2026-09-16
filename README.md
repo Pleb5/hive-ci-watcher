@@ -42,6 +42,7 @@ Whichever way, the watcher pubkey must be present in each loom worker's
 | `HIVE_CI_WATCHER_DB` | no | `./watcher.db` |
 | `HIVE_CI_WATCHER_RELAYS` | no | `wss://relay.budabit.club,wss://nos.lol,wss://relay.damus.io` |
 | `HIVE_CI_WATCHER_BLOSSOM_SERVERS` | no | `https://blossom.budabit.club,https://blossom.primal.net,https://cdn.sovbit.host` |
+| `HIVE_CI_WATCHER_FETCH_RETRY_WINDOW` | no | `600` (seconds; state events precede object uploads, so the remote is polled) |
 | `HIVE_CI_WATCHER_LOG_LEVEL` | no | `info` |
 
 When given, the nsec is read in plaintext for v1; NIP-49 is deferred.

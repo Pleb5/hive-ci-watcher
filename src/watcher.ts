@@ -16,7 +16,13 @@ import {
 import type {WatcherConfig} from './config.js'
 import type {WatcherDb} from './db/index.js'
 import {dispatchRun, type DispatchOutcome, type DispatchRequest} from './dispatch/submit.js'
-import {fetchWorkflowTree, WorkflowTreeCache, type WorkflowTree} from './git/fetch.js'
+import {
+  DEFAULT_RETRY_POLICY,
+  fetchWithRetry,
+  fetchWorkflowTree,
+  WorkflowTreeCache,
+  type WorkflowTree,
+} from './git/fetch.js'
 import type {WatcherIdentity} from './identity.js'
 import {createLogger, errorMessage} from './log.js'
 import {NostrClient, normalizeRelays, type RelayReport} from './nostr/client.js'
@@ -62,7 +68,7 @@ export interface WatcherStatus {
   recentRuns: ReturnType<WatcherDb['recentRuns']>
 }
 
-type Completion = 'complete' | 'incomplete'
+type Completion = 'complete' | 'incomplete' | 'superseded'
 
 interface RepoWatch {
   repoAddr: string
@@ -82,6 +88,8 @@ export class Watcher {
   private readonly trees = new WorkflowTreeCache()
   /** Serialises evaluation per repo so two 30618s cannot interleave a ref diff. */
   private readonly repoQueues = new Map<string, Promise<void>>()
+  /** The evaluation currently running (or queued) per repo; aborted when a newer one is enqueued. */
+  private readonly inflight = new Map<string, AbortController>()
   private readonly internal: Subscription[] = []
 
   private scheduleTimer: NodeJS.Timeout | null = null
@@ -284,7 +292,7 @@ export class Watcher {
     subscriptions.push(
       combineLatest([announcement$, states$])
         .pipe(debounceTime(EVALUATE_DEBOUNCE_MS))
-        .subscribe(() => this.enqueue(repoAddr, () => this.evaluateRepo(repoAddr))),
+        .subscribe(() => this.enqueue(repoAddr, signal => this.evaluateRepo(repoAddr, signal))),
     )
 
     const watch: RepoWatch = {repoAddr, owner, dTag, subscriptions, announcement$, probe: null}
@@ -333,6 +341,8 @@ export class Watcher {
     if (watch) for (const sub of watch.subscriptions) sub.unsubscribe()
     this.repos.delete(repoAddr)
     this.trees.invalidateRepo(repoAddr)
+    this.inflight.get(repoAddr)?.abort()
+    this.inflight.delete(repoAddr)
     const pending = this.repoQueues.get(repoAddr)
     if (pending) await pending.catch(() => undefined)
     this.repoQueues.delete(repoAddr)
@@ -342,14 +352,27 @@ export class Watcher {
    * Serialises work per repo. Two 30618s arriving back to back must not both
    * read `ref_state` before either writes it, or the second would re-dispatch
    * everything the first already handled.
+   *
+   * Enqueuing also **supersedes** whatever is in flight: its signal fires, so
+   * a poll waiting for a remote to catch up with an older commit stops, and
+   * the new task evaluates from the latest state instead. A ref that moved
+   * twice before its objects arrived is built once, at the newer commit.
+   * Dispatch itself is never interrupted — only the waits between phases.
    */
-  private enqueue(repoAddr: string, task: () => Promise<void>): void {
+  private enqueue(repoAddr: string, task: (signal: AbortSignal) => Promise<void>): void {
     if (!this.repos.has(repoAddr)) return
+    this.inflight.get(repoAddr)?.abort()
+    const controller = new AbortController()
+    this.inflight.set(repoAddr, controller)
+
     const previous = this.repoQueues.get(repoAddr) ?? Promise.resolve()
     const next = previous
       .catch(() => undefined)
-      .then(task)
+      .then(() => (controller.signal.aborted ? undefined : task(controller.signal)))
       .catch(err => log.error('repo evaluation failed', {repoAddr, error: errorMessage(err)}))
+      .finally(() => {
+        if (this.inflight.get(repoAddr) === controller) this.inflight.delete(repoAddr)
+      })
     this.repoQueues.set(repoAddr, next)
   }
 
@@ -367,7 +390,7 @@ export class Watcher {
       .filter((state): state is RepoState => state !== null)
   }
 
-  private async evaluateRepo(repoAddr: string): Promise<void> {
+  private async evaluateRepo(repoAddr: string, signal: AbortSignal): Promise<void> {
     const watch = this.repos.get(repoAddr)
     if (!watch) return
 
@@ -389,11 +412,19 @@ export class Watcher {
     const defaultBranch = resolveDefaultBranch(state, followed.defaultBranch)
     if (defaultBranch !== followed.defaultBranch) this.db.setDefaultBranch(repoAddr, defaultBranch)
 
+    // The default branch is always read at *its* current state commit — a new
+    // commit is a new cache key, so a push that changed the triggers or the
+    // schedules is seen before anything is evaluated against them.
     const defaultRefName = `refs/heads/${defaultBranch}`
     const defaultCommit = state.refs.find(entry => entry.ref === defaultRefName)?.commitId ?? null
     const defaultTree = defaultCommit
-      ? await this.loadWorkflows(announcement, defaultCommit, defaultRefName)
+      ? await this.loadWorkflows(announcement, defaultCommit, defaultRefName, signal)
       : {workflows: [], fetched: true}
+
+    if (signal.aborted) {
+      log.info('evaluation superseded by a newer state', {repoAddr, phase: 'default-branch'})
+      return
+    }
 
     if (defaultCommit && defaultTree.fetched) {
       this.db.replaceSchedules(
@@ -421,6 +452,11 @@ export class Watcher {
     }
 
     for (const change of diff.changed) {
+      if (signal.aborted) {
+        log.info('evaluation superseded by a newer state', {repoAddr, phase: 'refs', ref: change.descriptor.ref})
+        return
+      }
+
       const completion = await this.evaluateRefChange({
         announcement,
         defaultWorkflows: defaultTree.workflows,
@@ -428,7 +464,13 @@ export class Watcher {
         ref: change.descriptor,
         commitId: change.commitId,
         repoAddr,
+        signal,
       })
+
+      if (completion === 'superseded') {
+        log.info('evaluation superseded by a newer state', {repoAddr, phase: 'ref', ref: change.descriptor.ref})
+        return
+      }
 
       if (completion === 'complete') {
         this.db.putRefState(repoAddr, change.descriptor.ref, change.commitId)
@@ -449,10 +491,12 @@ export class Watcher {
     ref: RefDescriptor
     commitId: string
     repoAddr: string
+    signal: AbortSignal
   }): Promise<Completion> {
     if (!args.defaultFetched) return 'incomplete'
 
-    const pushed = await this.loadWorkflows(args.announcement, args.commitId, args.ref.ref)
+    const pushed = await this.loadWorkflows(args.announcement, args.commitId, args.ref.ref, args.signal)
+    if (args.signal.aborted) return 'superseded'
     if (!pushed.fetched) return 'incomplete'
 
     const paths = evaluatePush({
@@ -504,27 +548,72 @@ export class Watcher {
     }
   }
 
+  /** Why the last poll for a `(repo, commit)` ended without a tree. */
+  private readonly lastMiss = new Map<string, 'aborted' | 'exhausted'>()
+
+  /**
+   * Fetches a tree, polling while the remote has not yet caught up with the
+   * announced commit (see `fetchWithRetry`).
+   *
+   * The cache shares an in-flight fetch between callers, so a poll started by
+   * a superseded evaluation can be the one a newer evaluation awaits. That
+   * poll resolves `null` on abort and is evicted; when the miss was an abort
+   * (not an exhausted window) the second `get` starts a fresh poll owned by
+   * this evaluation's signal.
+   */
   private async loadWorkflows(
     announcement: RepoAnnouncement,
     commitId: string,
     refName: string,
+    signal: AbortSignal,
   ): Promise<{workflows: ParsedWorkflow[]; fetched: boolean}> {
     if (announcement.cloneUrls.length === 0) {
       log.warn('repo announcement has no usable clone urls', {repoAddr: announcement.repoAddr})
       return {workflows: [], fetched: false}
     }
 
+    const key = `${announcement.repoAddr}@${commitId.toLowerCase()}`
+    const load = () =>
+      this.trees.get(announcement.repoAddr, commitId, async () => {
+        const outcome = await fetchWithRetry(
+          () => fetchWorkflowTree({cloneUrls: announcement.cloneUrls, commitId, refName}),
+          {...DEFAULT_RETRY_POLICY, windowMs: this.config.fetchRetryWindowMs},
+          signal,
+          info =>
+            log.info('remote not yet at announced commit, retrying', {
+              repoAddr: announcement.repoAddr,
+              ref: refName,
+              commit: commitId.slice(0, 12),
+              attempt: info.attempt,
+              nextInMs: info.delayMs,
+              elapsedMs: info.elapsedMs,
+            }),
+        )
+        if (outcome.tree) this.lastMiss.delete(key)
+        else this.lastMiss.set(key, outcome.reason)
+        return outcome.tree
+      })
+
     let tree: WorkflowTree | null = null
     try {
-      tree = await this.trees.get(announcement.repoAddr, commitId, () =>
-        fetchWorkflowTree({cloneUrls: announcement.cloneUrls, commitId, refName}),
-      )
+      tree = await load()
+      if (!tree && !signal.aborted && this.lastMiss.get(key) === 'aborted') tree = await load()
     } catch (err) {
       log.warn('workflow fetch threw', {repoAddr: announcement.repoAddr, commitId, error: errorMessage(err)})
       return {workflows: [], fetched: false}
     }
 
-    if (!tree) return {workflows: [], fetched: false}
+    if (!tree) {
+      if (!signal.aborted) {
+        log.warn('remote never reached announced commit within the retry window', {
+          repoAddr: announcement.repoAddr,
+          ref: refName,
+          commit: commitId.slice(0, 12),
+          windowMs: this.config.fetchRetryWindowMs,
+        })
+      }
+      return {workflows: [], fetched: false}
+    }
     return {workflows: parseWorkflowTree(tree), fetched: true}
   }
 

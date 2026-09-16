@@ -113,12 +113,26 @@
             '';
           };
 
+          persistKey = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = ''
+              Generate the watcher key once and keep it in the state directory
+              (`watcher.key`, mode 0600), so the identity survives restarts.
+              Off by default: the daemon then generates a fresh key on every
+              start and logs its pubkey. Ignored when `nsecFile` is set.
+            '';
+          };
+
           nsecFile = lib.mkOption {
-            type = lib.types.path;
+            type = lib.types.nullOr lib.types.path;
+            default = null;
             description = ''
               Path to a file containing only the watcher's secret key (hex or
-              nsec). Read via systemd credentials so the key never enters the
-              Nix store — point this at a sops-nix or agenix output.
+              nsec), for an identity you manage yourself. Read via systemd
+              credentials so the key never enters the Nix store — point this
+              at a sops-nix or agenix output. Takes precedence over
+              `persistKey`.
             '';
           };
 
@@ -156,6 +170,7 @@
 
             environment = {
               HIVE_CI_WATCHER_OWNER_PUBKEY = cfg.ownerPubkey;
+              HIVE_CI_WATCHER_KEY_FILE = lib.mkIf (cfg.persistKey && cfg.nsecFile == null) "/var/lib/hive-ci-watcher/watcher.key";
               HIVE_CI_WATCHER_DB = cfg.databasePath;
               HIVE_CI_WATCHER_RELAYS = lib.concatStringsSep "," cfg.relays;
               HIVE_CI_WATCHER_BLOSSOM_SERVERS = lib.concatStringsSep "," cfg.blossomServers;
@@ -167,12 +182,15 @@
 
             serviceConfig = {
               Type = "simple";
-              # The nsec is loaded as a systemd credential and exported by the
-              # shell wrapper, so it is never a store path and never appears in
-              # the unit's environment block.
-              LoadCredential = "nsec:${cfg.nsecFile}";
+              # With nsecFile set, the nsec is loaded as a systemd credential and
+              # exported by the shell wrapper, so it is never a store path and
+              # never appears in the unit's environment block. Without it the
+              # daemon generates its own key per boot.
+              LoadCredential = lib.mkIf (cfg.nsecFile != null) "nsec:${cfg.nsecFile}";
               ExecStart = "${pkgs.writeShellScript "hive-ci-watcher-start" ''
-                export HIVE_CI_WATCHER_NSEC="$(tr -d '[:space:]' < "$CREDENTIALS_DIRECTORY/nsec")"
+                if [ -n "''${CREDENTIALS_DIRECTORY:-}" ] && [ -r "$CREDENTIALS_DIRECTORY/nsec" ]; then
+                  export HIVE_CI_WATCHER_NSEC="$(tr -d '[:space:]' < "$CREDENTIALS_DIRECTORY/nsec")"
+                fi
                 exec ${lib.getExe cfg.package}
               ''}";
 

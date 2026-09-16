@@ -13,26 +13,38 @@ manual.
 pnpm install
 pnpm build
 
-export HIVE_CI_WATCHER_NSEC=nsec1...              # or 64 hex chars
 export HIVE_CI_WATCHER_OWNER_PUBKEY=npub1...      # or 64 hex chars
 node dist/main.js
 ```
 
-The watcher pubkey it prints on startup must be present in each loom worker's
+By default the watcher **generates a fresh identity on every boot** and logs
+its pubkey (hex and npub) at startup; when it stops it retracts its ContextVM
+announcement so nothing discoverable points at a dead key.
+
+For an identity that survives restarts — which you will want once the pubkey
+is on workers' freelists and in repos' 30620 lists, since both are keyed by it
+— either:
+
+- `HIVE_CI_WATCHER_KEY_FILE=/path/to/watcher.key` — generated once on first
+  boot (mode 0600), read back on every later one; or
+- `HIVE_CI_WATCHER_NSEC=…` — a key you manage yourself. Takes precedence.
+
+Whichever way, the watcher pubkey must be present in each loom worker's
 `ALLOW_UNPAID_PUBKEYS`. That is added out of band — nothing here automates it.
 
 ## Configuration
 
 | Variable | Required | Default |
 |---|---|---|
-| `HIVE_CI_WATCHER_NSEC` | yes | — |
+| `HIVE_CI_WATCHER_NSEC` | no | — (wins over the key file) |
+| `HIVE_CI_WATCHER_KEY_FILE` | no | — (unset: a fresh key per boot) |
 | `HIVE_CI_WATCHER_OWNER_PUBKEY` | yes | — |
 | `HIVE_CI_WATCHER_DB` | no | `./watcher.db` |
 | `HIVE_CI_WATCHER_RELAYS` | no | `wss://relay.budabit.club,wss://nos.lol,wss://relay.damus.io` |
 | `HIVE_CI_WATCHER_BLOSSOM_SERVERS` | no | `https://blossom.budabit.club,https://blossom.primal.net,https://cdn.sovbit.host` |
 | `HIVE_CI_WATCHER_LOG_LEVEL` | no | `info` |
 
-The nsec is read in plaintext for v1; NIP-49 is deferred.
+When given, the nsec is read in plaintext for v1; NIP-49 is deferred.
 
 ## CLI
 
@@ -64,7 +76,9 @@ allowlist.
 
 ## Order of operations for a new deployment
 
-1. Start the daemon and note its pubkey.
+1. Start the daemon and note its pubkey. Decide now whether it should be
+   persistent (`HIVE_CI_WATCHER_KEY_FILE` or `HIVE_CI_WATCHER_NSEC`) — steps 2
+   and 5 bind to it.
 2. Add that pubkey to each loom worker's `ALLOW_UNPAID_PUBKEYS`.
 3. `runners-add` each worker you want to use — only workers that now have the
    watcher pubkey on their `ALLOW_UNPAID_PUBKEYS`. The pool is private and is
@@ -107,12 +121,14 @@ Every 5100 the watcher publishes omits the `payment` tag entirely.
   services.hive-ci-watcher = {
     enable = true;
     ownerPubkey = "npub1...";
-    nsecFile = config.sops.secrets.hive-ci-watcher-nsec.path;
+    persistKey = true;   # keep a generated key in /var/lib/hive-ci-watcher
+    # nsecFile = config.sops.secrets.hive-ci-watcher-nsec.path;  # or bring your own
   };
 }
 ```
 
-The nsec never enters the Nix store: the module takes a path and feeds it in
+Without `persistKey` or `nsecFile` the unit gets a new identity each start.
+`nsecFile` never enters the Nix store: the module takes a path and feeds it in
 via `LoadCredential`.
 
 `packages.default` pins its `pnpmDeps` hash. On the first build it is

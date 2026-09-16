@@ -1,4 +1,5 @@
-import {EncryptionMode, GiftWrapMode} from '@contextvm/sdk/core'
+import {DEFAULT_BOOTSTRAP_RELAY_URLS, EncryptionMode, GiftWrapMode} from '@contextvm/sdk/core'
+import {mergeRelaySets} from 'applesauce-core/helpers/relays'
 import {ApplesauceRelayPool} from '@contextvm/sdk/relay'
 import {PrivateKeySigner} from '@contextvm/sdk/signer'
 import {NostrServerTransport} from '@contextvm/sdk/transport'
@@ -374,6 +375,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
 
 export interface CvmServerHandle {
   close(): Promise<void>
+  /** Publishes NIP-09 deletions for the 11316/11317 announcements. */
+  retract(reason: string): Promise<void>
 }
 
 /**
@@ -432,6 +435,36 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     async close() {
       await server.close().catch(() => undefined)
       await relayPool.disconnect().catch(() => undefined)
+    },
+    async retract(reason) {
+      // The SDK's deleteAnnouncement collects ids from a subscription it never
+      // awaits, so it always finds nothing. Replaceable kinds need no ids
+      // anyway: a NIP-09 `a` tag addresses them by kind and author. Publish
+      // where the announcements went — our defaults plus the SDK's bootstrap
+      // relays — best-effort, one accept is enough.
+      const kinds = [11316, 11317, 11318, 11319, 11320]
+      const targets = mergeRelaySets(ctx.config.relays, DEFAULT_BOOTSTRAP_RELAY_URLS)
+      // Some relays only act on `e` tags for these kinds, so fetch our own
+      // announcements and name them by id as well as by address.
+      const own = await ctx.watcher.nostr.requestAll(
+        targets,
+        {kinds, authors: [ctx.identity.pubkey]},
+        5_000,
+        'retract:self',
+        1_500,
+      )
+      const deletion = ctx.identity.sign({
+        kind: 5,
+        created_at: Math.floor(Date.now() / 1000),
+        content: reason,
+        tags: [
+          ...kinds.map(kind => ['a', `${kind}:${ctx.identity.pubkey}:`]),
+          ...[...new Set(own.map(event => event.id))].map(id => ['e', id]),
+          ...kinds.map(kind => ['k', String(kind)]),
+        ],
+      })
+      const outcome = await ctx.watcher.nostr.publish(targets, deletion, 1, 8_000)
+      log.info('announcements retracted', {byId: own.length, acceptedBy: outcome.accepted, rejected: outcome.rejected.length})
     },
   }
 }

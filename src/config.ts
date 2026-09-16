@@ -1,4 +1,6 @@
-import {nip19} from 'nostr-tools'
+import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs'
+import {dirname} from 'node:path'
+import {generateSecretKey, nip19} from 'nostr-tools'
 import {normalizeRelays} from './nostr/relays.js'
 
 export {normalizeRelays}
@@ -18,6 +20,16 @@ export const DEFAULT_BLOSSOM_SERVERS = [
 export interface WatcherConfig {
   /** Watcher secret key, 64 hex chars. */
   secretKeyHex: string
+  /**
+   * Where the key came from. `generated` is the default: a fresh key every
+   * boot, so a watcher identity lives exactly as long as the process that
+   * announced it. `file` means `HIVE_CI_WATCHER_KEY_FILE` — generated once,
+   * written there, read back on every later boot. `env` is an explicit
+   * `HIVE_CI_WATCHER_NSEC`.
+   */
+  keySource: 'env' | 'file' | 'generated'
+  /** Set when `keySource` is `file`. */
+  keyFile?: string
   /** Watcher owner pubkey, 64 hex chars. Implicitly authorized for every CVM tool. */
   ownerPubkey: string
   databasePath: string
@@ -59,6 +71,35 @@ export function normalizePubkey(raw: string, label: string): string {
   throw new Error(`${label} must be an npub1… string or 64 hex characters`)
 }
 
+function freshSecretKeyHex(): string {
+  return Buffer.from(generateSecretKey()).toString('hex')
+}
+
+/**
+ * Key precedence: an explicit `HIVE_CI_WATCHER_NSEC`; else the key file, read
+ * if present and otherwise generated and written (mode 0600, one line of hex);
+ * else a fresh key for this boot only.
+ */
+export function resolveSecretKey(env: NodeJS.ProcessEnv): Pick<WatcherConfig, 'secretKeyHex' | 'keySource' | 'keyFile'> {
+  const nsec = env.HIVE_CI_WATCHER_NSEC?.trim()
+  if (nsec) return {secretKeyHex: normalizeSecretKey(nsec), keySource: 'env'}
+
+  const keyFile = env.HIVE_CI_WATCHER_KEY_FILE?.trim()
+  if (keyFile) {
+    if (existsSync(keyFile)) {
+      const raw = readFileSync(keyFile, 'utf8').trim()
+      if (!raw) throw new Error(`HIVE_CI_WATCHER_KEY_FILE ${keyFile} is empty`)
+      return {secretKeyHex: normalizeSecretKey(raw), keySource: 'file', keyFile}
+    }
+    const secretKeyHex = freshSecretKeyHex()
+    mkdirSync(dirname(keyFile), {recursive: true, mode: 0o700})
+    writeFileSync(keyFile, `${secretKeyHex}\n`, {mode: 0o600, flag: 'wx'})
+    return {secretKeyHex, keySource: 'file', keyFile}
+  }
+
+  return {secretKeyHex: freshSecretKeyHex(), keySource: 'generated'}
+}
+
 function splitList(raw: string | undefined, fallback: string[]): string[] {
   if (!raw) return [...fallback]
   const items = raw
@@ -69,14 +110,15 @@ function splitList(raw: string | undefined, fallback: string[]): string[] {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig {
-  const nsec = env.HIVE_CI_WATCHER_NSEC
-  if (!nsec) throw new Error('HIVE_CI_WATCHER_NSEC is required')
-
   const owner = env.HIVE_CI_WATCHER_OWNER_PUBKEY
   if (!owner) throw new Error('HIVE_CI_WATCHER_OWNER_PUBKEY is required')
 
+  const key = resolveSecretKey(env)
+
   return {
-    secretKeyHex: normalizeSecretKey(nsec),
+    secretKeyHex: key.secretKeyHex,
+    keySource: key.keySource,
+    ...(key.keyFile ? {keyFile: key.keyFile} : {}),
     ownerPubkey: normalizePubkey(owner, 'HIVE_CI_WATCHER_OWNER_PUBKEY'),
     databasePath: env.HIVE_CI_WATCHER_DB?.trim() || './watcher.db',
     relays: normalizeRelays(splitList(env.HIVE_CI_WATCHER_RELAYS, DEFAULT_RELAYS)),

@@ -13,7 +13,7 @@ State in SQLite (`better-sqlite3`). Remote control via ContextVM (MCP over Nostr
 
 | Identity | Key material | Role |
 |---|---|---|
-| **Watcher** | `HIVE_CI_WATCHER_NSEC` (env, hex or nsec) | Signs 5401 / 5100 / Blossom 24242 auth / CVM responses. Must be present in each loom worker's `ALLOW_UNPAID_PUBKEYS` — added out of band, nothing here automates it. |
+| **Watcher** | **Default: a fresh key generated at every boot**, logged as hex + npub on startup, its 11316 retracted (NIP-09 by address) on shutdown. `HIVE_CI_WATCHER_KEY_FILE` generates once and reuses; `HIVE_CI_WATCHER_NSEC` (hex or nsec) supplies one and wins. | Signs 5401 / 5100 / Blossom 24242 auth / CVM responses. Must be present in each loom worker's `ALLOW_UNPAID_PUBKEYS` — added out of band, nothing here automates it. Persist the key once it is on freelists or in 30620 lists; both bind to the pubkey. |
 | **Watcher owner** | never held by the daemon | Human. Pubkey in `HIVE_CI_WATCHER_OWNER_PUBKEY`. Publishes the runner list (kind 30621). Implicitly authorized for every CVM tool; needs no allowlist entry. |
 | **Requester** | — | Any pubkey in the watcher's allowlist. May follow/unfollow **any** repo. |
 | **Repo owner** | — | Author of the repo's kind 30617. Their announcement is the trust root: it defines the maintainer set. |
@@ -370,14 +370,15 @@ kv            (key PK, value)   -- round-robin cursor, cached runner-script
 Env:
 
 ```
-HIVE_CI_WATCHER_NSEC             required
+HIVE_CI_WATCHER_NSEC             optional; wins over the key file
+HIVE_CI_WATCHER_KEY_FILE         optional; generated once, reused. Unset: new key per boot
 HIVE_CI_WATCHER_OWNER_PUBKEY     required
 HIVE_CI_WATCHER_DB               default ./watcher.db
 HIVE_CI_WATCHER_RELAYS           comma-separated defaults
 HIVE_CI_WATCHER_BLOSSOM_SERVERS  comma-separated, ordered
 ```
 
-Plaintext nsec in env for v1; NIP-49 later.
+When given, plaintext nsec in env for v1; NIP-49 later.
 
 ---
 

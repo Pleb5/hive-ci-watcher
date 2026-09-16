@@ -36,6 +36,8 @@ export interface FetchOptions {
    * there is no configuration that makes a fixture refuse it.
    */
   forceRefFallback?: boolean
+  /** Try this clone URL first — the one a probe just saw serving the commit. */
+  preferredUrl?: string
 }
 
 /** A workflow file larger than this is skipped; YAML alias expansion is unbounded otherwise. */
@@ -189,7 +191,11 @@ async function fetchWorkflowTreeUnbounded(options: FetchOptions): Promise<Workfl
   // degrades to the old behaviour rather than failing.
   const fetchArgs = ['fetch', '--depth', '1', '--filter=blob:none', '--quiet', 'origin']
 
-  for (const cloneUrl of options.cloneUrls) {
+  const ordered = options.preferredUrl
+    ? [options.preferredUrl, ...options.cloneUrls.filter(url => url !== options.preferredUrl)]
+    : options.cloneUrls
+
+  for (const cloneUrl of ordered) {
     const dir = await mkdtemp(join(tmpdir(), 'hive-ci-watcher-'))
     try {
       await git(dir, ['init', '--quiet'], timeoutMs)
@@ -246,6 +252,44 @@ async function fetchWorkflowTreeUnbounded(options: FetchOptions): Promise<Workfl
   return null
 }
 
+/**
+ * Does `cloneUrl` serve `commitId` at `refName`? One `git ls-remote` round
+ * trip, no working tree, no pack — asked for the ref and its peeled form, so
+ * an annotated tag answers with the commit the 30618 announced.
+ *
+ * Without a ref name every advertised ref is listed and any match counts.
+ */
+export async function remoteServesCommit(
+  cloneUrl: string,
+  commitId: string,
+  refName?: string,
+  timeoutMs = 30_000,
+): Promise<boolean> {
+  const commit = commitId.toLowerCase()
+  const patterns = refName ? [refName, `${refName}^{}`] : []
+  try {
+    const out = await git(tmpdir(), ['ls-remote', '--quiet', cloneUrl, ...patterns], timeoutMs)
+    return out
+      .split('\n')
+      .some(line => line.split('\t')[0]?.trim().toLowerCase() === commit)
+  } catch (err) {
+    log.debug('ls-remote failed', {cloneUrl, error: errorMessage(err)})
+    return false
+  }
+}
+
+/** The first clone URL, in announcement order, that serves the commit; `null` if none does yet. */
+export async function findRemoteServingCommit(
+  cloneUrls: string[],
+  commitId: string,
+  refName?: string,
+): Promise<string | null> {
+  for (const cloneUrl of cloneUrls) {
+    if (await remoteServesCommit(cloneUrl, commitId, refName)) return cloneUrl
+  }
+  return null
+}
+
 export interface RetryPolicy {
   /** Total time to keep trying, from the first attempt. */
   windowMs: number
@@ -260,14 +304,15 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
 }
 
 /**
- * Retries a fetch until it yields a tree, the window closes, or the caller
- * aborts.
+ * Polls until a remote serves the announced commit, then fetches — or gives
+ * up when the window closes or the caller aborts.
  *
- * A repo's state event routinely arrives *before* its objects: ngit publishes
- * the 30618, then uploads to the grasp server. Fetching in that gap sees the
- * previous tip and fails the commit check — correctly, but it is not a
- * failure to give up on. Poll with backoff; the announced commit is the
- * thing that decides, so every attempt re-checks it.
+ * A repo's state event arrives *before* its objects by design: ngit publishes
+ * the 30618, then uploads to the grasp server. So a miss right after a push
+ * is expected. Each poll is a `probe` — one `ls-remote` per clone URL, no
+ * pack — and only once some remote has the commit is the tree actually
+ * fetched, from that remote first. At least one remote is enough: that is
+ * what the runner will clone from too.
  *
  * `signal` is the caller's supersession signal: when a newer state event
  * moves the ref again there is no point finishing this poll, so it stops
@@ -277,8 +322,15 @@ export type FetchRetryOutcome =
   | {tree: WorkflowTree; reason: 'fetched'}
   | {tree: null; reason: 'aborted' | 'exhausted'}
 
+export interface RetryAttempt {
+  /** Which clone URL, if any, serves the commit right now. */
+  probe: () => Promise<string | null>
+  /** Fetch the tree, preferring the remote the probe found. */
+  fetch: (preferredUrl: string) => Promise<WorkflowTree | null>
+}
+
 export async function fetchWithRetry(
-  attempt: () => Promise<WorkflowTree | null>,
+  attempt: RetryAttempt,
   policy: RetryPolicy,
   signal?: AbortSignal,
   onRetry?: (info: {attempt: number; delayMs: number; elapsedMs: number}) => void,
@@ -287,8 +339,13 @@ export async function fetchWithRetry(
   let delay = policy.initialDelayMs
   for (let attemptNumber = 1; ; attemptNumber += 1) {
     if (signal?.aborted) return {tree: null, reason: 'aborted'}
-    const tree = await attempt()
-    if (tree) return {tree, reason: 'fetched'}
+    const url = await attempt.probe()
+    if (url) {
+      // A probe hit followed by a fetch miss (the pack still landing, a
+      // transient error) is just another miss: keep polling.
+      const tree = await attempt.fetch(url)
+      if (tree) return {tree, reason: 'fetched'}
+    }
     if (signal?.aborted) return {tree: null, reason: 'aborted'}
 
     const elapsedMs = Date.now() - started

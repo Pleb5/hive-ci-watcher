@@ -3,7 +3,7 @@ import {mkdtempSync, mkdirSync, rmSync, writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
-import {fetchWorkflowTree, gitEnvironment, WorkflowTreeCache} from '../src/git/fetch.js'
+import {fetchWorkflowTree, findRemoteServingCommit, gitEnvironment, remoteServesCommit, WorkflowTreeCache} from '../src/git/fetch.js'
 
 let repoDir: string
 /** A remote that drifted out of sync with the announced repo state. */
@@ -161,6 +161,32 @@ describe('shallow fetch with commit verification', () => {
       refName: 'refs/heads/main',
     })
     expect(tree).toBeNull()
+  })
+})
+
+describe('probing a remote for a commit', () => {
+  it('answers yes for the branch tip and no for a commit the remote does not serve', async () => {
+    expect(await remoteServesCommit(`file://${repoDir}`, secondCommit, 'refs/heads/main')).toBe(true)
+    expect(await remoteServesCommit(`file://${repoDir}`, '0'.repeat(40), 'refs/heads/main')).toBe(false)
+    expect(await remoteServesCommit(`file://${driftDir}`, secondCommit, 'refs/heads/main')).toBe(false)
+  })
+
+  it('sees through an annotated tag to the peeled commit', async () => {
+    expect(await remoteServesCommit(`file://${tagDir}`, tagPeeledCommit, 'refs/tags/v1.0.0')).toBe(true)
+  })
+
+  it('is false, not an error, for an unreachable remote', async () => {
+    expect(await remoteServesCommit(`file://${repoDir}-nope`, secondCommit, 'refs/heads/main')).toBe(false)
+  })
+
+  it('returns the first clone url that has caught up', async () => {
+    const found = await findRemoteServingCommit(
+      [`file://${driftDir}`, `file://${repoDir}-nope`, `file://${repoDir}`],
+      secondCommit,
+      'refs/heads/main',
+    )
+    expect(found).toBe(`file://${repoDir}`)
+    expect(await findRemoteServingCommit([`file://${driftDir}`], secondCommit, 'refs/heads/main')).toBeNull()
   })
 })
 

@@ -20,6 +20,7 @@ import {
   DEFAULT_RETRY_POLICY,
   fetchWithRetry,
   fetchWorkflowTree,
+  findRemoteServingCommit,
   WorkflowTreeCache,
   type WorkflowTree,
 } from './git/fetch.js'
@@ -576,7 +577,11 @@ export class Watcher {
     const load = () =>
       this.trees.get(announcement.repoAddr, commitId, async () => {
         const outcome = await fetchWithRetry(
-          () => fetchWorkflowTree({cloneUrls: announcement.cloneUrls, commitId, refName}),
+          {
+            probe: () => findRemoteServingCommit(announcement.cloneUrls, commitId, refName),
+            fetch: preferredUrl =>
+              fetchWorkflowTree({cloneUrls: announcement.cloneUrls, commitId, refName, preferredUrl}),
+          },
           {...DEFAULT_RETRY_POLICY, windowMs: this.config.fetchRetryWindowMs},
           signal,
           info =>

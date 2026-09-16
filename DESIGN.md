@@ -241,12 +241,16 @@ Given a repo and a target commit:
 4. Sparse-checkout `.github/workflows/` and `.ngit/workflows/`. Both directories
    hold the same GitHub Actions YAML schema; the union is the workflow set, with
    `.github` winning on a path collision.
-5. All remotes exhausted → **poll**. A repo's state event routinely arrives
-   before its objects — ngit publishes the 30618, then uploads to the grasp
-   server — so a miss right after a push is expected, not final. Retry with
-   backoff (5 s doubling to 30 s) for `HIVE_CI_WATCHER_FETCH_RETRY_WINDOW`
-   (default 10 min); every attempt re-checks the announced commit. Only when
-   the window closes is the evaluation left incomplete.
+5. **Probe before fetching, and poll.** A repo's state event arrives before
+   its objects by design — ngit publishes the 30618, then uploads to the
+   grasp server — so a miss right after a push is expected, not final. Each
+   poll is `git ls-remote <url> <ref> <ref>^{}` per clone URL: one round
+   trip, no pack, and the `^{}` line answers for annotated tags. Only once
+   **at least one** remote serves the announced commit is the tree fetched,
+   from that remote first. Backoff 5 s doubling to 30 s for
+   `HIVE_CI_WATCHER_FETCH_RETRY_WINDOW` (default 10 min); only when the
+   window closes is the evaluation left incomplete. One remote is enough —
+   it is what the runner will clone from too.
 
    **A newer state event supersedes the poll.** Each repo has one evaluation
    in flight; enqueuing another fires its abort signal, the poll stops between

@@ -9,21 +9,30 @@ describe('polling a remote that has not caught up', () => {
   it('keeps trying until the announced commit is served', async () => {
     let calls = 0
     const retries: number[] = []
+    let fetches = 0
     const outcome = await fetchWithRetry(
-      async () => (++calls < 4 ? null : tree()),
+      {
+        probe: async () => (++calls < 4 ? null : 'https://remote.example/repo.git'),
+        fetch: async url => (fetches += 1, url === 'https://remote.example/repo.git' ? tree() : null),
+      },
       fast,
       undefined,
       info => retries.push(info.delayMs),
     )
     expect(outcome.reason).toBe('fetched')
     expect(calls).toBe(4)
+    // No pack was pulled while the remote was still lagging.
+    expect(fetches).toBe(1)
     // Backoff doubles up to the cap.
     expect(retries).toEqual([20, 40, 50])
   })
 
   it('gives up once the window is spent', async () => {
     let calls = 0
-    const outcome = await fetchWithRetry(async () => (++calls, null), {windowMs: 150, initialDelayMs: 40, maxDelayMs: 40})
+    const outcome = await fetchWithRetry(
+      {probe: async () => (++calls, null), fetch: async () => tree()},
+      {windowMs: 150, initialDelayMs: 40, maxDelayMs: 40},
+    )
     expect(outcome).toEqual({tree: null, reason: 'exhausted'})
     expect(calls).toBeGreaterThanOrEqual(3)
     expect(calls).toBeLessThanOrEqual(5)
@@ -33,13 +42,17 @@ describe('polling a remote that has not caught up', () => {
     const controller = new AbortController()
     let calls = 0
     let resolveAttempt: (() => void) | undefined
-    const attempt = () =>
-      new Promise<WorkflowTree | null>(resolve => {
+    const probe = () =>
+      new Promise<string | null>(resolve => {
         calls += 1
         resolveAttempt = () => resolve(null)
       })
 
-    const pending = fetchWithRetry(attempt, {windowMs: 60_000, initialDelayMs: 5_000, maxDelayMs: 5_000}, controller.signal)
+    const pending = fetchWithRetry(
+      {probe, fetch: async () => tree()},
+      {windowMs: 60_000, initialDelayMs: 5_000, maxDelayMs: 5_000},
+      controller.signal,
+    )
     await new Promise(r => setTimeout(r, 5))
     expect(calls).toBe(1)
 
@@ -55,7 +68,11 @@ describe('polling a remote that has not caught up', () => {
   it('cuts a backoff sleep short on abort', async () => {
     const controller = new AbortController()
     const started = Date.now()
-    const pending = fetchWithRetry(async () => null, {windowMs: 60_000, initialDelayMs: 10_000, maxDelayMs: 10_000}, controller.signal)
+    const pending = fetchWithRetry(
+      {probe: async () => null, fetch: async () => tree()},
+      {windowMs: 60_000, initialDelayMs: 10_000, maxDelayMs: 10_000},
+      controller.signal,
+    )
     setTimeout(() => controller.abort(), 30)
     const outcome = await pending
     expect(outcome.reason).toBe('aborted')
@@ -66,9 +83,21 @@ describe('polling a remote that has not caught up', () => {
     const controller = new AbortController()
     controller.abort()
     let calls = 0
-    const outcome = await fetchWithRetry(async () => (++calls, tree()), fast, controller.signal)
+    const outcome = await fetchWithRetry({probe: async () => (++calls, 'x'), fetch: async () => tree()}, fast, controller.signal)
     expect(outcome.reason).toBe('aborted')
     expect(calls).toBe(0)
+  })
+})
+
+describe('probe hit, fetch miss', () => {
+  it('keeps polling instead of giving up', async () => {
+    let fetches = 0
+    const outcome = await fetchWithRetry(
+      {probe: async () => 'x', fetch: async () => (++fetches < 3 ? null : tree())},
+      fast,
+    )
+    expect(outcome.reason).toBe('fetched')
+    expect(fetches).toBe(3)
   })
 })
 

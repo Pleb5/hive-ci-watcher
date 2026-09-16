@@ -70,6 +70,9 @@ State in SQLite (`better-sqlite3`). Remote control via ContextVM (MCP over Nostr
 - **ContextVM announcements**, published by `@contextvm/sdk`:
   `11316` server announcement, `11317` tools list, plus a kind `0` profile and a
   kind `10002` relay list. Messages ride kind `25910`, gift-wrapped as `21059`.
+  The CVM server listens and announces on the configured defaults ∪
+  `wss://relay.contextvm.org` ∪ `wss://relay2.contextvm.org`, and announces
+  additionally on the SDK's bootstrap relays.
   No custom watcher-announcement kind — the watcher instead sets
   `['t', 'hive-ci-watcher']` as an extra common tag (`setExtraCommonTags`) on its
   11316, which makes `{kinds:[11316], '#t':['hive-ci-watcher']}` the discovery

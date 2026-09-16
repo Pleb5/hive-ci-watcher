@@ -1,3 +1,4 @@
+import './env-defaults.js'
 import {nip19} from 'nostr-tools'
 import {loadConfig} from './config.js'
 import {Authorizer} from './cvm/auth.js'

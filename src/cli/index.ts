@@ -1,10 +1,11 @@
 #!/usr/bin/env node
+import '../env-defaults.js'
 import {EncryptionMode, GiftWrapMode} from '@contextvm/sdk/core'
 import {ApplesauceRelayPool} from '@contextvm/sdk/relay'
 import {PrivateKeySigner} from '@contextvm/sdk/signer'
 import {NostrClientTransport} from '@contextvm/sdk/transport'
 import {Client} from '@contextvm/mcp-sdk/client/index.js'
-import {DEFAULT_RELAYS, normalizePubkey, normalizeRelays, normalizeSecretKey} from '../config.js'
+import {CVM_RELAYS, DEFAULT_RELAYS, normalizePubkey, normalizeRelays, normalizeSecretKey} from '../config.js'
 import {errorMessage} from '../log.js'
 
 /**
@@ -82,9 +83,10 @@ async function main(): Promise<void> {
   const serverPubkey = process.env.HIVE_CI_WATCHER_PUBKEY
   if (!serverPubkey) throw new Error('HIVE_CI_WATCHER_PUBKEY is required')
 
-  const relays = normalizeRelays(
-    (process.env.HIVE_CI_WATCHER_RELAYS || DEFAULT_RELAYS.join(',')).split(','),
-  )
+  const relays = normalizeRelays([
+    ...(process.env.HIVE_CI_WATCHER_RELAYS || DEFAULT_RELAYS.join(',')).split(','),
+    ...CVM_RELAYS,
+  ])
 
   const relayPool = new ApplesauceRelayPool(relays)
   const transport = new NostrClientTransport({

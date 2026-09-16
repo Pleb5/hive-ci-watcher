@@ -49,7 +49,8 @@ When given, the nsec is read in plaintext for v1; NIP-49 is deferred.
 ## CLI
 
 The CLI is a thin ContextVM client — every subcommand is one tool call against
-a running daemon.
+a running daemon. Both ends use the configured relays plus
+`wss://relay.contextvm.org` and `wss://relay2.contextvm.org`.
 
 ```sh
 export HIVE_CI_WATCHER_CLI_NSEC=nsec1...   # owner, or an allowlisted requester

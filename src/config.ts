@@ -11,6 +11,13 @@ export const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
 ]
 
+/**
+ * ContextVM's own relays. The CVM server listens here as well as on the
+ * defaults, announces here, and retracts here; the CLI reaches the daemon
+ * here. Not used for repo watching or run publishing.
+ */
+export const CVM_RELAYS = ['wss://relay.contextvm.org', 'wss://relay2.contextvm.org']
+
 export const DEFAULT_BLOSSOM_SERVERS = [
   'https://blossom.budabit.club',
   'https://blossom.primal.net',
@@ -34,6 +41,8 @@ export interface WatcherConfig {
   ownerPubkey: string
   databasePath: string
   relays: string[]
+  /** Where the ContextVM server listens and announces: `relays` ∪ `CVM_RELAYS`. */
+  cvmRelays: string[]
   /** Ordered; the first server that answers wins. */
   blossomServers: string[]
 }
@@ -122,6 +131,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig 
     ownerPubkey: normalizePubkey(owner, 'HIVE_CI_WATCHER_OWNER_PUBKEY'),
     databasePath: env.HIVE_CI_WATCHER_DB?.trim() || './watcher.db',
     relays: normalizeRelays(splitList(env.HIVE_CI_WATCHER_RELAYS, DEFAULT_RELAYS)),
+    cvmRelays: normalizeRelays([...splitList(env.HIVE_CI_WATCHER_RELAYS, DEFAULT_RELAYS), ...CVM_RELAYS]),
     blossomServers: splitList(env.HIVE_CI_WATCHER_BLOSSOM_SERVERS, DEFAULT_BLOSSOM_SERVERS).map(
       server => server.replace(/\/+$/, ''),
     ),

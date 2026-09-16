@@ -6,7 +6,7 @@ import {NostrServerTransport} from '@contextvm/sdk/transport'
 import {McpServer} from '@contextvm/mcp-sdk/server/mcp.js'
 import type {NostrEvent} from 'nostr-tools'
 import {z} from 'zod'
-import type {WatcherConfig} from '../config.js'
+import {CVM_RELAYS, type WatcherConfig} from '../config.js'
 import type {WatcherDb} from '../db/index.js'
 import type {WatcherIdentity} from '../identity.js'
 import {createLogger, errorMessage} from '../log.js'
@@ -89,13 +89,15 @@ export function isFreshRequest(
  */
 function guarded(
   ctx: ToolContext,
+  tool: string,
   audience: ToolAudience,
   handler: (args: any, caller: string) => Promise<ToolResult> | ToolResult,
 ) {
   return async (args: any, extra: any): Promise<ToolResult> => {
     const caller = callerPubkey(extra ?? {})
+    log.info('tool call', {tool, caller: caller?.slice(0, 12) ?? 'anonymous'})
     if (!ctx.authorizer.authorize(caller, audience)) {
-      log.warn('tool call refused', {audience, caller: caller?.slice(0, 12) ?? 'anonymous'})
+      log.warn('tool call refused', {tool, audience, caller: caller?.slice(0, 12) ?? 'anonymous'})
       return fail(NOT_AUTHORIZED)
     }
 
@@ -104,6 +106,7 @@ function guarded(
       const event = typeof requestEventId === 'string' ? ctx.getRequestEvent(requestEventId) : undefined
       if (!isFreshRequest(event, caller)) {
         log.warn('tool call refused as stale or undated', {
+          tool,
           caller: caller?.slice(0, 12),
           createdAt: event?.created_at ?? null,
         })
@@ -113,6 +116,7 @@ function guarded(
     try {
       return await handler(args ?? {}, caller!)
     } catch (err) {
+      log.warn('tool call failed', {tool, error: errorMessage(err)})
       return fail(errorMessage(err))
     }
   }
@@ -197,7 +201,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         'Add a repo to the follow table. Any repo — the watcher performs no maintainer check on the caller.',
       inputSchema: repoAddressShape,
     },
-    guarded(ctx, 'allowlisted', async (args, caller) => {
+    guarded(ctx, 'follow_repo', 'allowlisted', async (args, caller) => {
       const {repoAddr, repoOwner, dTag, relayHints} = resolveRepoAddress(args)
       db.followRepo({repoAddr, repoOwner, dTag, addedBy: caller, relayHints})
       const stored = db.getFollowedRepo(repoAddr)
@@ -213,7 +217,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Remove a repo from the follow table, along with its ref state and schedules.',
       inputSchema: repoAddressShape,
     },
-    guarded(ctx, 'allowlisted', async args => {
+    guarded(ctx, 'unfollow_repo', 'allowlisted', async args => {
       const {repoAddr} = resolveRepoAddress(args)
       await watcher.unwatchRepo(repoAddr)
       const removed = db.unfollowRepo(repoAddr)
@@ -227,7 +231,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Followed repos with their per-ref last-seen commit.',
       inputSchema: {},
     },
-    guarded(ctx, 'allowlisted', () =>
+    guarded(ctx, 'list_followed', 'allowlisted', () =>
       ok({
         repos: db.listFollowedRepos().map(repo => ({
           repo_addr: repo.repoAddr,
@@ -261,7 +265,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Uptime, relay health, runner pool size, and recent runs.',
       inputSchema: {},
     },
-    guarded(ctx, 'allowlisted', () => ok(watcher.status())),
+    guarded(ctx, 'status', 'allowlisted', () => ok(watcher.status())),
   )
 
   server.registerTool(
@@ -273,7 +277,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         'membership asserts an unpaid arrangement with the worker.',
       inputSchema: {},
     },
-    guarded(ctx, 'allowlisted', async () => {
+    guarded(ctx, 'list_runners', 'allowlisted', async () => {
       const workers = watcher.knownWorkers()
       const now = Date.now()
       const cursorRaw = db.getKv(CURSOR_KEY)
@@ -312,7 +316,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Add a runner pubkey to the private pool. The pool is never published.',
       inputSchema: {pubkey: z.string().describe('Loom worker pubkey (hex)')},
     },
-    guarded(ctx, 'owner', args => {
+    guarded(ctx, 'runners_add', 'owner', args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
       db.addRunner(pubkey)
       return ok({added: pubkey})
@@ -325,7 +329,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Remove a runner pubkey from the pool.',
       inputSchema: {pubkey: z.string().describe('Loom worker pubkey (hex)')},
     },
-    guarded(ctx, 'owner', args => {
+    guarded(ctx, 'runners_remove', 'owner', args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
       return ok({removed: pubkey, existed: db.removeRunner(pubkey)})
     }),
@@ -337,7 +341,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Add a requester to the allowlist.',
       inputSchema: {pubkey: z.string().describe('Requester pubkey (hex)')},
     },
-    guarded(ctx, 'owner', args => {
+    guarded(ctx, 'allow_pubkey', 'owner', args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
       db.allowPubkey(pubkey)
       return ok({allowed: pubkey})
@@ -350,7 +354,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Remove a requester from the allowlist.',
       inputSchema: {pubkey: z.string().describe('Requester pubkey (hex)')},
     },
-    guarded(ctx, 'owner', args => {
+    guarded(ctx, 'revoke_pubkey', 'owner', args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
       return ok({revoked: pubkey, existed: db.revokePubkey(pubkey)})
     }),
@@ -362,7 +366,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Dump the allowlist. The owner is implicitly authorized and is not listed.',
       inputSchema: {},
     },
-    guarded(ctx, 'owner', () =>
+    guarded(ctx, 'list_allowed', 'owner', () =>
       ok({
         owner: ctx.config.ownerPubkey,
         allowed: db.listAllowed().map(entry => ({pubkey: entry.pubkey, added_at: entry.addedAt})),
@@ -398,16 +402,25 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     {capabilities: {tools: {}}},
   )
 
-  // The management surface lives on the configured defaults only. Relays
-  // learned from followed repos are for watching those repos, and a bad one
-  // must not be able to keep the CVM server from starting.
-  const relayPool = new ApplesauceRelayPool(ctx.config.relays)
+  // The management surface lives on the configured defaults plus ContextVM's
+  // relays. Relays learned from followed repos are for watching those repos,
+  // and a bad one must not be able to keep the CVM server from starting.
+  const relayPool = new ApplesauceRelayPool(ctx.config.cvmRelays)
   const transport = new NostrServerTransport({
     signer: new PrivateKeySigner(ctx.identity.secretKeyHex),
     relayHandler: relayPool,
     encryptionMode: EncryptionMode.REQUIRED,
-    giftWrapMode: GiftWrapMode.EPHEMERAL,
+    // OPTIONAL accepts both persistent (1059) and ephemeral (21059) wraps and
+    // mirrors the client's choice on the reply. EPHEMERAL would subscribe to
+    // 21059 only — and a client that has not yet learned
+    // `support_encryption_ephemeral` (a stateless client connecting off the
+    // 11316 alone never does) sends 1059, which the server would then never
+    // even see. The announcement still advertises ephemeral support, so
+    // clients that can use it do.
+    giftWrapMode: GiftWrapMode.OPTIONAL,
     isAnnouncedServer: true,
+    // Announcements also go to these discoverability-only targets.
+    bootstrapRelayUrls: mergeRelaySets(DEFAULT_BOOTSTRAP_RELAY_URLS, CVM_RELAYS),
     // The caller's pubkey has to reach the tool handlers; the transport reads
     // it off the decrypted inner event. The request event id lets the guard
     // fetch that same signed event and check its timestamp.
@@ -443,7 +456,7 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
       // where the announcements went — our defaults plus the SDK's bootstrap
       // relays — best-effort, one accept is enough.
       const kinds = [11316, 11317, 11318, 11319, 11320]
-      const targets = mergeRelaySets(ctx.config.relays, DEFAULT_BOOTSTRAP_RELAY_URLS)
+      const targets = mergeRelaySets(ctx.config.cvmRelays, DEFAULT_BOOTSTRAP_RELAY_URLS, CVM_RELAYS)
       // Some relays only act on `e` tags for these kinds, so fetch our own
       // announcements and name them by id as well as by address.
       const own = await ctx.watcher.nostr.requestAll(
@@ -464,7 +477,7 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
         ],
       })
       const outcome = await ctx.watcher.nostr.publish(targets, deletion, 1, 8_000)
-      log.info('announcements retracted', {byId: own.length, acceptedBy: outcome.accepted, rejected: outcome.rejected.length})
+      log.info('announcements retracted', {byId: own.length, acceptedBy: outcome.accepted, rejected: outcome.rejected})
     },
   }
 }

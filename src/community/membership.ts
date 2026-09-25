@@ -1,5 +1,5 @@
 import type {NostrEvent} from 'nostr-tools'
-import {communityPointer, HEX64, listAddress, personReportTarget, preferred, parseDefinition, retractedReport, tags, type Definition} from './protocol.js'
+import {communityPointer, HEX64, listAddress, personReportTarget, preferred, parseDefinition, retractedReport, scopedIdentifier, tags, type Definition} from './protocol.js'
 
 /** A private authority view: generic NIP-09 processing must never erase 32222/30000 here. */
 export class CommunityView {
@@ -18,13 +18,15 @@ export class CommunityView {
       const definition = parseDefinition(event)
       if (!definition || definition.address !== this.address || !preferred(event, this.definition?.event)) return false
       this.definition = definition
-      const referenced = new Set(this.refs().map(ref => ref.address))
-      for (const address of this.lists.keys()) if (!referenced.has(address)) this.lists.delete(address)
       return true
     }
     if (event.kind === 30000) {
       const address = listAddress(event)
-      if (!address || !this.refs().some(ref => ref.address === address) || !preferred(event, this.lists.get(address))) return false
+      // Remember replacement high-water evidence even while a list is absent
+      // from the definition. Intake only requests referenced lists; restoration
+      // must also accept previously observed, now-unreferenced scoped lists.
+      if (!address || !scopedIdentifier(communityPointer(this.address)!.id, tags(event, 'd')[0]![1]!) ||
+        !preferred(event, this.lists.get(address))) return false
       this.lists.set(address, event)
       return true
     }
@@ -48,10 +50,9 @@ export class CommunityView {
   refs() { return this.definition?.sections.flatMap(section => section.refs) ?? [] }
 
   snapshot(): NostrEvent[] {
-    const referenced = new Set(this.refs().map(ref => ref.address))
     return [
       ...(this.definition ? [this.definition.event] : []),
-      ...[...this.lists].filter(([address]) => referenced.has(address)).map(([, event]) => event),
+      ...this.lists.values(),
       ...this.reports.values(),
       ...new Map([...this.retractions.values()].map(event => [event.id, event])).values(),
     ]

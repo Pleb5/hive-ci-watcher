@@ -11,27 +11,81 @@ export function verified(event: NostrEvent): boolean {
   try { return verifyEvent(event) } catch { return false }
 }
 
+interface QueryJob {
+  run: () => Promise<NostrEvent[]>
+  resolve: (events: NostrEvent[]) => void
+  reject: (error: Error) => void
+}
+
+interface QueryOwner {
+  signal: AbortSignal
+  waiting: QueryJob[]
+  active: boolean
+  abort: () => void
+}
+
 /** Raw verified intake, deliberately independent of EventStore's deletion manager. */
 export class RelayAuthorityTransport implements AuthorityTransport {
   private active = 0
-  private readonly waiting: Array<() => void> = []
+  private readonly owners = new Map<AbortSignal, QueryOwner>()
   constructor(private readonly pool: RelayPool) {}
 
   async query(relays: string[], filter: Filter, signal: AbortSignal): Promise<NostrEvent[]> {
-    const results = await Promise.allSettled([...new Set(relays)].map(async url => {
-      if (this.active >= 4) await new Promise<void>(resolve => this.waiting.push(resolve))
-      else this.active++
-      try { return await this.queryRelay(url, filter, signal) }
-      finally {
-        const next = this.waiting.shift()
-        if (next) next()
-        else this.active--
-      }
-    }))
+    const results = await Promise.allSettled([...new Set(relays)].map(url =>
+      this.schedule(signal, () => this.queryRelay(url, filter, signal)),
+    ))
     if (signal.aborted) throw new Error('authority synchronization aborted')
     const successes = results.filter((r): r is PromiseFulfilledResult<NostrEvent[]> => r.status === 'fulfilled')
     if (!successes.length) throw new Error('no community relay completed the authority query')
     return [...new Map(successes.flatMap(r => r.value).map(event => [event.id, event])).values()]
+  }
+
+  /** One active relay per synchronization owner, four globally. Rotate owners
+   * after each attempt so a branch's fan-out cannot crowd out another branch
+   * or repo. Queued cancellation never needs to wait for somebody else's I/O. */
+  private schedule(signal: AbortSignal, run: QueryJob['run']): Promise<NostrEvent[]> {
+    if (signal.aborted) return Promise.reject(new Error('authority synchronization aborted'))
+    let owner = this.owners.get(signal)
+    if (!owner) {
+      const group: QueryOwner = {signal, waiting: [], active: false, abort: () => {
+        for (const job of group.waiting.splice(0)) job.reject(new Error('authority synchronization aborted'))
+        if (!group.active) this.removeOwner(group)
+        this.drain()
+      }}
+      owner = group
+      this.owners.set(signal, owner)
+      signal.addEventListener('abort', owner.abort, {once: true})
+    }
+    const group = owner
+    return new Promise((resolve, reject) => {
+      group.waiting.push({run, resolve, reject})
+      this.drain()
+    })
+  }
+
+  private removeOwner(owner: QueryOwner): void {
+    this.owners.delete(owner.signal)
+    owner.signal.removeEventListener('abort', owner.abort)
+  }
+
+  private drain(): void {
+    while (this.active < 4) {
+      const owner = [...this.owners.values()].find(owner => !owner.active && owner.waiting.length && !owner.signal.aborted)
+      if (!owner) return
+      const job = owner.waiting.shift()!
+      owner.active = true
+      this.active++
+      void job.run().then(job.resolve, job.reject).finally(() => {
+        this.active--
+        owner.active = false
+        if (!owner.waiting.length) this.removeOwner(owner)
+        else {
+          this.owners.delete(owner.signal)
+          this.owners.set(owner.signal, owner)
+        }
+        this.drain()
+      })
+    }
   }
 
   private async queryRelay(url: string, filter: Filter, signal: AbortSignal): Promise<NostrEvent[]> {

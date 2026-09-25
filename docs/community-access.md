@@ -78,6 +78,10 @@ NIP-09 deletion manager. Updates must be replacements: remove `p` tags, remove
 definition references, or apply effective bans. Valid report retractions still
 work. An authority cache retains the latest observed valid protected events;
 an empty relay response does not erase previously observed authority.
+The latest observed list version is retained even when its reference is removed
+from the definition, including in persisted snapshots. Only current references
+grant membership; restoring a reference cannot roll back a known revocation by
+replaying an older list version.
 
 This is an explicit v1 exception to the Budabit/strfry historical-deletion
 semantics, not a claim of full deletion parity. It matches the chosen watcher
@@ -101,7 +105,10 @@ that a relay stores every event ever published elsewhere.
 History requests paginate with overlapping timestamps. An unpageable saturated
 timestamp or an exceeded page/history bound fails the refresh. Individual
 pages have a 15-second deadline, the synchronization pass has a 60-second
-deadline, and query concurrency is capped at four.
+deadline, and query concurrency is capped at four. Each synchronization owner
+(community or repository hydration pass) gets at most one active relay attempt;
+waiting owners rotate after attempts, and queued requests cancel immediately.
+One owner's relay fan-out cannot occupy all four slots ahead of another owner.
 
 Live changes apply immediately; only completed synchronization renews freshness.
 A changed definition invalidates completeness until its dependencies are
@@ -149,8 +156,13 @@ after losing eligibility. Returning eligibility reactivates watching; deleting
 the last registration removes shared watch state after pending evaluation ends.
 
 Every start or resume waits for a completed repository announcement/state sync,
-then seeds current refs without dispatch. Cached pre-suspension refs cannot act
-as the resume baseline. Missed scheduled runs are not replayed. Dispatch checks
+then seeds current refs without dispatch. The selected announcement and any
+existing selected state must actually occur in that synchronization's responses;
+empty EOSE cannot validate a cached pre-suspension candidate. Incomplete baselines
+retry, while a genuinely new repository can seed its first future state. Suspension
+immediately invalidates a live watch's baseline, and serialized reconciliation
+rechecks current activation after earlier repositories' teardowns. Missed
+scheduled runs are not replayed. Dispatch checks
 current eligibility and the activation epoch after async preparation and before
 both the 5401 announcement and 5100 job publication. Suspension invalidates old
 work even if access returns quickly. A published announcement may have no job

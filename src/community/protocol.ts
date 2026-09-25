@@ -51,7 +51,7 @@ function addressRef(value = '', requiredKind?: number): ListRef | undefined {
   return {address: value, owner, identifier}
 }
 
-function scopedIdentifier(id: string, identifier: string): boolean {
+export function scopedIdentifier(id: string, identifier: string): boolean {
   if (!identifier.startsWith(`${id}-`) || bytes(identifier) > 200) return false
   return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\.(?:[2-9]|[1-9][0-9]+))?$/.test(identifier.slice(id.length + 1))
 }

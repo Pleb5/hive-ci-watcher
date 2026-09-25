@@ -266,6 +266,11 @@ export class Watcher {
         this.db.setRepoActive(repo.repoAddr, false)
         this.epochs.set(repo.repoAddr, (this.epochs.get(repo.repoAddr) ?? 0) + 1)
         this.inflight.get(repo.repoAddr)?.abort()
+        const watch = this.repos.get(repo.repoAddr)
+        if (watch) {
+          watch.baselineReady = false
+          watch.baselineController?.abort()
+        }
       }
     }
     if (!this.readyForRepos || !this.running) return Promise.resolve()
@@ -274,9 +279,15 @@ export class Watcher {
     this.reconcilePending = Promise.resolve().then(async () => {
       do {
         this.reconcileDirty = false
-        for (const repo of this.db.listFollowedRepos()) {
+        for (const {repoAddr} of this.db.listFollowedRepos()) {
           if (!this.running) return
-          if (!this.isEligible(repo.repoAddr) || !repo.active) {
+          // Earlier teardowns yield; a later repo may have been suspended and
+          // restored since the iteration began. Eligibility can itself expire
+          // a source, so read activation after checking it, not before.
+          const eligible = this.isEligible(repoAddr)
+          const repo = this.db.getFollowedRepo(repoAddr)
+          if (!repo) continue
+          if (!eligible || !repo.active) {
             await this.unwatchRepo(repo.repoAddr)
             if (!this.running) return
             // An evaluation interrupted during an await may have recorded
@@ -412,16 +423,24 @@ export class Watcher {
       if (!current()) return
       found.forEach(event => this.nostr.store.add(event))
       const announcement = this.currentAnnouncement(watch)
-      watch.probe = {checkedAt: Math.floor(Date.now() / 1000), found: !!announcement, relays}
-      if (!announcement) return
+      const synchronizedAnnouncement = !!announcement && found.some(event => event.id === announcement.event.id)
+      watch.probe = {checkedAt: Math.floor(Date.now() / 1000), found: synchronizedAnnouncement, relays}
+      if (!announcement || !synchronizedAnnouncement) return
+      const synchronizedStates = new Set<string>()
       for (const maintainer of announcement.maintainers) {
         const maintainerOutboxes = await firstOutboxes(this.nostr, maintainer)
         const events = await this.authorityTransport.query(mergeRelaySets(relays, announcement.relays, maintainerOutboxes),
           {kinds: [KIND_REPO_STATE], authors: [maintainer], '#d': [watch.dTag]}, controller.signal)
         if (!current()) return
         events.forEach(event => this.nostr.store.add(event))
+        events.forEach(event => synchronizedStates.add(event.id))
       }
       if (this.currentAnnouncement(watch)?.event.id !== announcement.event.id) return
+      const candidate = selectRepoState(this.currentStates(watch, announcement.maintainers), announcement.maintainers)
+      // Empty EOSE is not evidence for an old cached candidate. Retry until
+      // the selected state is actually returned by a synchronization. A truly
+      // new repo with no candidate can still seed its first future state.
+      if (candidate && !synchronizedStates.has(candidate.event.id)) return
       watch.baselineReady = true
       this.enqueue(watch.repoAddr, signal => this.evaluateRepo(watch.repoAddr, signal))
     } catch (error) {

@@ -83,6 +83,86 @@ describe('eligibility at submission boundaries', () => {
 })
 
 describe('activation and suspension', () => {
+  it('can bootstrap a genuinely new repository after an empty completed state query', async () => {
+    const {db, watcher, internal, publish} = setup()
+    const announcement = event(30617, [['d', 'test'], ['clone', 'https://git.example/repo']])
+    db.setRepoActive(REPO, true)
+    const watch = {repoAddr: REPO, owner: OWNER, dTag: 'test', subscriptions: [], hints: new BehaviorSubject([]), baselineReady: false}
+    internal.repos.set(REPO, watch)
+    vi.spyOn(watcher.nostr, 'loadReplaceable').mockResolvedValue(undefined)
+    vi.spyOn(internal, 'loadWorkflows').mockResolvedValue({workflows: [], fetched: true})
+    vi.spyOn(internal.authorityTransport, 'query').mockImplementation(async (_relays, filter: any) => filter.kinds[0] === 30617 ? [announcement] : [])
+    await internal.hydrateRepo(watch)
+    await internal.repoQueues.get(REPO)
+    expect(watch.baselineReady).toBe(true)
+    expect(db.getFollowedRepo(REPO)!.seededAt).toBeNull()
+    watcher.nostr.store.add(event(30618, [['d', 'test'], [REF, COMMIT]]))
+    await internal.evaluateRepo(REPO, new AbortController().signal)
+    expect(db.getRefStates(REPO)).toMatchObject([{commitId: COMMIT}])
+    expect(publish).not.toHaveBeenCalled()
+  })
+  it.each([30617, 30618])('does not validate cached baseline evidence with an empty kind-%s response', async missingKind => {
+    const {db, watcher, internal, publish} = setup()
+    const announcement = event(30617, [['d', 'test'], ['clone', 'https://git.example/repo']])
+    const oldState = event(30618, [['d', 'test'], [REF, COMMIT]])
+    const suspendedState = event(30618, [['d', 'test'], [REF, '2'.repeat(40)]], 1, 1001)
+    watcher.nostr.store.add(announcement)
+    watcher.nostr.store.add(oldState)
+    db.setRepoActive(REPO, true)
+    const watch = {repoAddr: REPO, owner: OWNER, dTag: 'test', subscriptions: [], hints: new BehaviorSubject([]), baselineReady: false}
+    internal.repos.set(REPO, watch)
+    vi.spyOn(watcher.nostr, 'loadReplaceable').mockResolvedValue(undefined)
+    vi.spyOn(internal, 'loadWorkflows').mockResolvedValue({workflows: [], fetched: true})
+    const changes = vi.spyOn(internal, 'evaluateRefChange').mockResolvedValue('complete')
+    const query = vi.spyOn(internal.authorityTransport, 'query').mockImplementation(async (_relays, filter: any) => {
+      if (filter.kinds[0] === missingKind) return []
+      return filter.kinds[0] === 30617 ? [announcement] : [oldState]
+    })
+    await internal.hydrateRepo(watch)
+    await internal.repoQueues.get(REPO)
+    expect(db.getFollowedRepo(REPO)!.seededAt).toBeNull()
+    expect(watch.baselineReady).toBe(false)
+    watcher.nostr.store.add(suspendedState)
+    await internal.evaluateRepo(REPO, new AbortController().signal)
+    expect(changes).not.toHaveBeenCalled()
+    query.mockImplementation(async (_relays, filter: any) => filter.kinds[0] === 30617 ? [announcement] : [suspendedState])
+    await internal.hydrateRepo(watch)
+    await internal.repoQueues.get(REPO)
+    expect(db.getRefStates(REPO)).toMatchObject([{commitId: '2'.repeat(40)}])
+    expect(changes).not.toHaveBeenCalled()
+    expect(publish).not.toHaveBeenCalled()
+  })
+  it('recreates a revoked/restored watch delayed behind another repository teardown', async () => {
+    const {db, watcher, internal} = setup()
+    internal.readyForRepos = true
+    vi.spyOn(watcher.nostr, 'outboxes$').mockReturnValue(of([]))
+    vi.spyOn(watcher.nostr, 'subscribe').mockImplementation(() => new Subscription())
+    vi.spyOn(watcher.nostr, 'subscribeOutbox').mockImplementation(() => new Subscription())
+    const hydrate = vi.spyOn(internal, 'hydrateRepo').mockResolvedValue(undefined)
+    const later = `30617:${OWNER}:later`
+    db.allowPubkey(OTHER)
+    db.followRepo({repoAddr: later, repoOwner: OWNER, dTag: 'later', addedBy: OTHER})
+    await watcher.reconcileAccess()
+    const originalWatch = internal.repos.get(later)
+    originalWatch.baselineReady = true
+    hydrate.mockClear()
+    let release!: () => void
+    internal.repoQueues.set(REPO, new Promise<void>(resolve => { release = resolve }))
+    db.revokePubkey(MEMBER)
+    const pending = watcher.reconcileAccess()
+    await Promise.resolve() // The loop snapshots both rows and blocks on REPO's queue.
+    db.revokePubkey(OTHER)
+    void watcher.reconcileAccess()
+    db.allowPubkey(OTHER)
+    void watcher.reconcileAccess()
+    const invalidatedImmediately = !originalWatch.baselineReady
+    release()
+    await pending
+    expect(invalidatedImmediately).toBe(true)
+    expect(internal.repos.get(later)).not.toBe(originalWatch)
+    expect(internal.repos.get(later).baselineReady).toBe(false)
+    expect(hydrate).toHaveBeenCalledWith(internal.repos.get(later))
+  })
   it('discards offline progress on startup and re-establishes registration access', async () => {
     const {db, watcher, internal} = setup()
     internal.running = false

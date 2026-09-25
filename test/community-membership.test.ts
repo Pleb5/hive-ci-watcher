@@ -34,6 +34,22 @@ describe('shared Budabit/strfry conformance', () => {
 })
 
 describe('authority view deletion exception and replacement', () => {
+  it.each([false, true])('retains list replacement history across reference removal (restart=%s)', restart => {
+    let view = new CommunityView(ADDRESS)
+    const grant = list()
+    for (const e of [definition(), grant, list([], 1002), definition(1003, 1, COMMUNITY, [])]) view.apply(e)
+    expect(view.members().has(MEMBER)).toBe(false)
+    if (restart) {
+      const saved = view.snapshot()
+      view = new CommunityView(ADDRESS)
+      saved.forEach(e => view.apply(e))
+    }
+    view.apply(definition(1004))
+    view.apply(grant)
+    expect(view.members().has(MEMBER)).toBe(false)
+    view.apply(list([MEMBER], 1005))
+    expect(view.members().has(MEMBER)).toBe(true)
+  })
   it('ignores coordinate, kind and event-ID deletion before and after protected events', () => {
     const original = definition(), shard = list()
     const deletions = [

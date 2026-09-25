@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_created_at_idx ON runs (created_at DESC);
 CREATE INDEX IF NOT EXISTS runs_repo_idx ON runs (repo_addr, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS run_jobs (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  job_id TEXT NOT NULL UNIQUE,
+  inboxes TEXT NOT NULL,
+  outboxes TEXT NOT NULL,
+  state TEXT NOT NULL,
+  pending_evaluation INTEGER NOT NULL DEFAULT 1,
+  evidence TEXT,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS allowlist (
   pubkey   TEXT PRIMARY KEY,
   added_at INTEGER NOT NULL

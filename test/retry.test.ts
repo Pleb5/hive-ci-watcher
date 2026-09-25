@@ -103,7 +103,7 @@ describe('probe hit, fetch miss', () => {
 
 describe('retry window config', () => {
   it('defaults to ten minutes and reads seconds from the environment', () => {
-    const owner = {HIVE_CI_WATCHER_OWNER_PUBKEY: 'a'.repeat(64)}
+    const owner = {HIVE_CI_WATCHER_OWNER_PUBKEY: 'a'.repeat(64), HIVE_CI_WATCHER_RELAYS: 'wss://service.example'}
     expect(loadConfig(owner).fetchRetryWindowMs).toBe(600_000)
     expect(loadConfig({...owner, HIVE_CI_WATCHER_FETCH_RETRY_WINDOW: '90'}).fetchRetryWindowMs).toBe(90_000)
     expect(loadConfig({...owner, HIVE_CI_WATCHER_FETCH_RETRY_WINDOW: 'nope'}).fetchRetryWindowMs).toBe(600_000)

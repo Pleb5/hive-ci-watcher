@@ -1,12 +1,13 @@
-import {DEFAULT_BOOTSTRAP_RELAY_URLS, EncryptionMode, GiftWrapMode} from '@contextvm/sdk/core'
-import {mergeRelaySets} from 'applesauce-core/helpers/relays'
-import {ApplesauceRelayPool} from '@contextvm/sdk/relay'
+import {EncryptionMode, GiftWrapMode} from '@contextvm/sdk/core'
 import {PrivateKeySigner} from '@contextvm/sdk/signer'
 import {NostrServerTransport} from '@contextvm/sdk/transport'
 import {McpServer} from '@contextvm/mcp-sdk/server/mcp.js'
 import type {NostrEvent} from 'nostr-tools'
 import {z} from 'zod'
-import {CVM_RELAYS, type WatcherConfig} from '../config.js'
+import {map, distinctUntilChanged} from 'rxjs'
+import {DirectedRelayHandler} from './relay-handler.js'
+import {handover} from '../nostr/handover.js'
+import type {WatcherConfig} from '../config.js'
 import type {WatcherDb} from '../db/index.js'
 import type {WatcherIdentity} from '../identity.js'
 import {createLogger, errorMessage} from '../log.js'
@@ -278,7 +279,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     guarded(ctx, 'status', 'registered', (_args, caller) => ok({
       ...watcher.status(authorizer.isOwner(caller) ? undefined : caller),
       access: authorizer.sources(caller),
-      ...(authorizer.isOwner(caller) ? {communities: watcher.communities.status()} : {}),
+      ...(authorizer.isOwner(caller) ? {communities: watcher.communities.status(), infrastructure: watcher.infrastructure.current} : {}),
     })),
   )
 
@@ -300,6 +301,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         db.listRunnerPool().map(async entry => {
           const worker = workers.get(entry.pubkey)
           const online = !!worker && isWorkerOnline(worker, now)
+          const list = ctx.watcher.nostr.store.getReplaceable(10002, entry.pubkey)
+          const inboxes = normalizeRelays(list?.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'read')).map(t => t[1]!) ?? [])
+          const outboxes = normalizeRelays(list?.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]!) ?? [])
           return {
             pubkey: entry.pubkey,
             added_at: entry.addedAt,
@@ -315,7 +319,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             on_freelist: worker ? await watcher.freelistStatus(entry.pubkey) : null,
             queue_depth: worker?.currentQueueDepth ?? null,
             last_seen: worker?.lastSeen ?? null,
-            eligible: online,
+            inboxes, outboxes, mailbox_resolved: !!inboxes.length && !!outboxes.length,
+            eligible: online && !!inboxes.length && !!outboxes.length,
           }
         }),
       )
@@ -330,9 +335,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Add a runner pubkey to the private pool. The pool is never published.',
       inputSchema: {pubkey: z.string().describe('Loom worker pubkey (hex)')},
     },
-    guarded(ctx, 'runners_add', 'owner', args => {
+    guarded(ctx, 'runners_add', 'owner', async args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
       db.addRunner(pubkey)
+      await watcher.refreshRunners([pubkey])
       return ok({added: pubkey})
     }),
   )
@@ -343,9 +349,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Remove a runner pubkey from the pool.',
       inputSchema: {pubkey: z.string().describe('Loom worker pubkey (hex)')},
     },
-    guarded(ctx, 'runners_remove', 'owner', args => {
+    guarded(ctx, 'runners_remove', 'owner', async args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
-      return ok({removed: pubkey, existed: db.removeRunner(pubkey)})
+      const existed = db.removeRunner(pubkey)
+      await watcher.refreshRunners([])
+      return ok({removed: pubkey, existed})
     }),
   )
 
@@ -419,10 +427,22 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     {capabilities: {tools: {}}},
   )
 
-  // The management surface lives on the configured defaults plus ContextVM's
-  // relays. Relays learned from followed repos are for watching those repos,
-  // and a bad one must not be able to keep the CVM server from starting.
-  const relayPool = new ApplesauceRelayPool(ctx.config.cvmRelays)
+  // Management subscriptions, replies, and discovery each have distinct roles.
+  const routes$ = ctx.watcher.infrastructure.routes$
+  const announcements = new Map<number, NostrEvent>()
+  const announcementTargets = () => normalizeRelays([...routes$.value.outbox, ...ctx.config.serviceDiscoveryRelays])
+  let replyOutboxes = routes$.value.outbox
+  const replyRoutes = handover(routes$.pipe(map(routes => routes.outbox), distinctUntilChanged((a, b) => a.join() === b.join())))
+    .subscribe(routes => { replyOutboxes = routes })
+  const relayPool = new DirectedRelayHandler(ctx.watcher.nostr,
+    handover(routes$.pipe(map(routes => routes.inbox), distinctUntilChanged((a, b) => a.join() === b.join()))),
+    event => event.kind >= 11316 && event.kind <= 11320 ? announcementTargets() : replyOutboxes,
+    // This handler has no undirected relay set. Endpoint metadata is published
+    // below with NIP-65 markers; returning a union here makes the SDK bypass
+    // this handler using an unauthenticated temporary pool.
+    () => [],
+    event => { if (event.kind >= 11316 && event.kind <= 11320) announcements.set(event.kind, event) },
+  )
   const transport = new NostrServerTransport({
     signer: new PrivateKeySigner(ctx.identity.secretKeyHex),
     relayHandler: relayPool,
@@ -436,8 +456,9 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     // clients that can use it do.
     giftWrapMode: GiftWrapMode.OPTIONAL,
     isAnnouncedServer: true,
-    // Announcements also go to these discoverability-only targets.
-    bootstrapRelayUrls: mergeRelaySets(DEFAULT_BOOTSTRAP_RELAY_URLS, CVM_RELAYS),
+    // All discovery publications go through the authenticated directed handler.
+    bootstrapRelayUrls: [],
+    publishRelayList: false,
     // The caller's pubkey has to reach the tool handlers; the transport reads
     // it off the decrypted inner event. The request event id lets the guard
     // fetch that same signed event and check its timestamp.
@@ -458,11 +479,42 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
     getRequestEvent: id => transport.getNostrRequestEvent(id),
   })
 
-  await server.connect(transport)
-  log.info('contextvm server announced', {pubkey: ctx.identity.pubkey, tag: WATCHER_DISCOVERY_TAG})
+  try { await server.connect(transport) }
+  catch (error) { replyRoutes.unsubscribe(); await relayPool.disconnect(); throw error }
+  let pending = Promise.resolve()
+  let closed = false
+  let timestamp = Number(ctx.db.getKv('infrastructure:metadata-timestamp') ?? 0)
+  const refreshMetadata = () => {
+    const routes = routes$.value
+    pending = pending.then(async () => {
+      if (closed) return
+      timestamp = Math.max(Math.floor(Date.now() / 1000), timestamp + 1)
+      ctx.db.setKv('infrastructure:metadata-timestamp', String(timestamp))
+      const tags = normalizeRelays([...routes.inbox, ...routes.outbox]).map(url =>
+        routes.inbox.includes(url) && routes.outbox.includes(url) ? ['r', url] : ['r', url, routes.inbox.includes(url) ? 'read' : 'write'])
+      const event = ctx.identity.sign({kind: 10002, created_at: timestamp, content: '', tags})
+      await ctx.watcher.nostr.publish(normalizeRelays([...routes.inbox, ...routes.outbox,
+        ...ctx.config.identityDiscoveryRelays, ...ctx.config.serviceDiscoveryRelays]), event, 1)
+      for (const original of announcements.values()) {
+        const event = ctx.identity.sign({kind: original.kind, content: original.content, tags: original.tags, created_at: timestamp})
+        announcements.set(event.kind, event)
+        await ctx.watcher.nostr.publish(announcementTargets(), event, 1)
+      }
+    }).catch(error => log.warn('service metadata publication failed', {error: errorMessage(error)}))
+  }
+  const metadata = routes$.pipe(
+    map(routes => JSON.stringify([routes.inbox, routes.outbox])), distinctUntilChanged(),
+  ).subscribe(refreshMetadata)
+  const metadataTimer = setInterval(refreshMetadata, 60000)
+  log.info('contextvm transport started', {pubkey: ctx.identity.pubkey, tag: WATCHER_DISCOVERY_TAG})
 
   return {
     async close() {
+      closed = true
+      clearInterval(metadataTimer)
+      metadata.unsubscribe()
+      replyRoutes.unsubscribe()
+      await pending
       await server.close().catch(() => undefined)
       await relayPool.disconnect().catch(() => undefined)
     },
@@ -470,10 +522,10 @@ export async function startCvmServer(ctx: ToolContext): Promise<CvmServerHandle>
       // The SDK's deleteAnnouncement collects ids from a subscription it never
       // awaits, so it always finds nothing. Replaceable kinds need no ids
       // anyway: a NIP-09 `a` tag addresses them by kind and author. Publish
-      // where the announcements went — our defaults plus the SDK's bootstrap
-      // relays — best-effort, one accept is enough.
+       // where the announcements went — service outboxes and discovery —
+      // best-effort, one accept is enough.
       const kinds = [11316, 11317, 11318, 11319, 11320]
-      const targets = mergeRelaySets(ctx.config.cvmRelays, DEFAULT_BOOTSTRAP_RELAY_URLS, CVM_RELAYS)
+      const targets = announcementTargets()
       // Some relays only act on `e` tags for these kinds, so fetch our own
       // announcements and name them by id as well as by address.
       const own = await ctx.watcher.nostr.requestAll(

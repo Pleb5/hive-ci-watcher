@@ -1,14 +1,13 @@
 import {EventStore} from 'applesauce-core'
-import {getSeenRelays, mergeRelaySets} from 'applesauce-core/helpers/relays'
+import {getSeenRelays, normalizeRelayUrl} from 'applesauce-core/helpers/relays'
 import type {OutboxMap} from 'applesauce-core/helpers/relay-selection'
 import {createEventLoaderForStore} from 'applesauce-loaders/loaders'
 import {RelayGroup, RelayLiveness, RelayPool} from 'applesauce-relay'
 import {ignoreUnhealthyRelays} from 'applesauce-relay/operators'
-import type {Filter, NostrEvent} from 'nostr-tools'
-import {verifyEvent} from 'nostr-tools/pure'
+import {matchFilters, type Filter, type NostrEvent} from 'nostr-tools'
+import {verified} from '../community/transport.js'
 import {
   BehaviorSubject,
-  combineLatest,
   distinctUntilChanged,
   filter,
   firstValueFrom,
@@ -18,11 +17,13 @@ import {
   of,
   timeout,
   toArray,
+  withLatestFrom,
   type Observable,
   type Subscription,
 } from 'rxjs'
 import {createLogger, errorMessage} from '../log.js'
 import {normalizeRelays} from './relays.js'
+import {IDENTITY_DISCOVERY_RELAYS} from '../infrastructure.js'
 
 export {normalizeRelays}
 
@@ -32,7 +33,7 @@ const log = createLogger('nostr')
  * NIP-65 index relays consulted when a kind 10002 is not on any relay we
  * already talk to. Used only for lookups, never for publishing.
  */
-export const LOOKUP_RELAYS = ['wss://purplepag.es', 'wss://index.hzrd149.com', 'wss://relay.nostr.band']
+export const LOOKUP_RELAYS = IDENTITY_DISCOVERY_RELAYS
 
 export interface PublishOutcome {
   accepted: string[]
@@ -71,7 +72,7 @@ export class NostrClient {
   private readonly eventCounts = new Map<string, number>()
   private readonly internal: Subscription[] = []
 
-  constructor(defaultRelays: string[]) {
+  constructor(defaultRelays: string[], lookupRelays = LOOKUP_RELAYS, signer?: {signEvent(event: import('nostr-tools').EventTemplate): Promise<NostrEvent>}) {
     this.defaults$ = new BehaviorSubject(normalizeRelays(defaultRelays))
 
     // Per-relay liveness ping: a relay that stops answering REQs is
@@ -87,16 +88,19 @@ export class NostrClient {
     this.liveness.connectToPool(this.pool)
 
     this.store = new EventStore()
-    this.store.verifyEvent = verifyEvent
+    this.store.verifyEvent = verified
 
     createEventLoaderForStore(this.store, this.pool, {
       extraRelays: this.defaults$,
-      lookupRelays: LOOKUP_RELAYS,
+      lookupRelays,
       followRelayHints: true,
     })
 
     this.internal.push(
       this.pool.add$.subscribe(relay => {
+        if (signer) this.internal.push(relay.challenge$.subscribe(challenge => {
+          if (challenge) void relay.authenticate(signer).catch(err => log.warn('relay AUTH failed', {relay: relay.url, error: errorMessage(err)}))
+        }))
         this.internal.push(
           relay.connected$.subscribe(connected =>
             log.debug('relay connection', {relay: relay.url, connected}),
@@ -110,11 +114,10 @@ export class NostrClient {
     return this.defaults$.value
   }
 
-  /** Drops dead / backing-off relays from a relay stream. Always keeps at least the defaults. */
+  /** Health can narrow a role's routes; it must never add another role's defaults. */
   healthy(relays: string[] | Observable<string[]>): Observable<string[]> {
     const source = isObservable(relays) ? relays : of(relays)
-    return combineLatest([source, this.defaults$]).pipe(
-      map(([urls, defaults]) => mergeRelaySets(defaults, urls)),
+    return source.pipe(
       ignoreUnhealthyRelays(this.liveness),
       map(urls => normalizeRelays(urls)),
       distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
@@ -131,7 +134,12 @@ export class NostrClient {
     filters: Filter | Filter[] | Observable<Filter | Filter[]>,
     label: string,
   ): Subscription {
-    return this.pool.subscription(this.healthy(relays), filters, {eventStore: null}).subscribe({
+    const queries = isObservable(filters) ? filters : of(filters)
+    return this.pool.subscription(this.healthy(relays), filters, {eventStore: null}).pipe(
+      withLatestFrom(queries),
+      filter(([event, query]) => verified(event) && matchFilters(Array.isArray(query) ? query : [query], event)),
+      map(([event]) => event),
+    ).subscribe({
       next: event => this.ingest(event, label),
       error: err => log.error('subscription errored', {label, error: errorMessage(err)}),
     })
@@ -147,8 +155,23 @@ export class NostrClient {
     filter: Omit<Filter, 'authors'>,
     label: string,
   ): Subscription {
-    return this.pool.outboxSubscription(outboxes, filter, {eventStore: null}).subscribe({
-      next: event => this.ingest(event, label),
+    // RelayPool indexes filter maps using its own URL form (including a root
+    // slash). Protocol/config URLs omit that slash; normalize at this boundary
+    // or the SDK sends an undefined filter for an otherwise valid destination.
+    const normalized = (isObservable(outboxes) ? outboxes : of(outboxes)).pipe(map(boxes => {
+      const result: OutboxMap = {}
+      for (const [url, pointers] of Object.entries(boxes)) {
+        const key = normalizeRelayUrl(url)
+        result[key] = [...(result[key] ?? []), ...pointers]
+      }
+      return result
+    }))
+    return this.pool.outboxSubscription(normalized, filter, {eventStore: null}).pipe(
+      withLatestFrom(normalized),
+      map(([event, boxes]) => ({event, authors: new Set(Object.values(boxes).flat().map(pointer => pointer.pubkey))})),
+      // `filter` is the query parameter here, so use a map guard at ingress.
+    ).subscribe({
+      next: ({event, authors}) => { if (verified(event) && authors.has(event.pubkey) && matchFilters([filter], event)) this.ingest(event, label) },
       error: err => log.error('outbox subscription errored', {label, error: errorMessage(err)}),
     })
   }
@@ -180,12 +203,13 @@ export class NostrClient {
             eventStore: null,
           })
           .pipe(
+            filter(event => verified(event) && matchFilters(Array.isArray(filters) ? filters : [filters], event)),
             map(event => {
               this.ingest(event, label)
               return event
             }),
-            timeout({first: timeoutMs, each: timeoutMs}),
             toArray(),
+            timeout(timeoutMs),
           ),
         {defaultValue: []},
       )
@@ -230,6 +254,11 @@ export class NostrClient {
       map(boxes => normalizeRelays(boxes?.outboxes ?? [])),
       distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
     )
+  }
+
+  async inboxes(pubkey: string): Promise<string[]> {
+    const event = await this.loadReplaceable({kind: 10002, pubkey})
+    return event ? normalizeRelays(event.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'read')).map(t => t[1]!)) : []
   }
 
   /**
@@ -285,6 +314,7 @@ export class NostrClient {
   }
 
   private ingest(event: NostrEvent, label: string): void {
+    if (!verified(event)) return
     // applesauce stamps each event with the relay it came from; that is what
     // makes a per-relay "last event at" possible.
     const nowSeconds = Math.floor(Date.now() / 1000)

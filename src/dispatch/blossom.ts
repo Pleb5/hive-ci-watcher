@@ -62,7 +62,7 @@ export async function resolveRunnerScriptUrl(args: {
   const cached = db.getKv(CACHED_URL_KEY)
   const cachedServer = cached && cached.endsWith(`/${hash}`) ? cached.slice(0, -(hash.length + 1)) : null
 
-  const ordered = cachedServer
+  const ordered = cachedServer && servers.some(server => server.replace(/\/+$/, '') === cachedServer)
     ? [cachedServer, ...servers.filter(server => server.replace(/\/+$/, '') !== cachedServer)]
     : servers
 

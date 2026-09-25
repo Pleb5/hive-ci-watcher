@@ -10,8 +10,7 @@ export interface EligibleRunner {
  *
  * "Allowed" is the private `runner_pool` table, which only the owner can write
  * (`runners_add`). Putting a pubkey in it asserts that the watcher is on that
- * worker's `ALLOW_UNPAID_PUBKEYS` — an out-of-band arrangement the watcher has
- * no way to read from Nostr.
+ * worker's Nostr freelist — an operator arrangement, readable when advertised.
  *
  * A worker's advertised pricing is therefore **not** a gate. A kind 10100 is
  * one public replaceable event serving every reader, so a worker that runs

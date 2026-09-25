@@ -1,4 +1,4 @@
-import {isSafeRelayURL, normalizeRelayUrl} from 'applesauce-core/helpers/relays'
+import {normalizeUrl} from '../community/protocol.js'
 
 /**
  * Normalises and validates relay URLs. Relays arrive from the environment, from
@@ -11,16 +11,9 @@ export function normalizeRelays(urls: Iterable<string | undefined | null>): stri
   for (const raw of urls) {
     if (!raw) continue
     const trimmed = raw.trim()
-    if (!trimmed || !isSafeRelayURL(trimmed)) continue
-    try {
-      const url = normalizeRelayUrl(trimmed)
-      // No Tor transport here; an .onion relay would sit in every relay set
-      // as a permanent never-connects entry.
-      if (new URL(url).hostname.toLowerCase().endsWith('.onion')) continue
-      out.add(url)
-    } catch {
-      // unparseable — skip
-    }
+    const url = normalizeUrl(trimmed, ['wss:', 'ws:'])
+    // This client has no Tor transport.
+    if (url && !new URL(url).hostname.toLowerCase().endsWith('.onion')) out.add(url)
   }
   return [...out].sort()
 }

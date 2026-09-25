@@ -15,6 +15,8 @@ import {
 } from 'rxjs'
 import {Authorizer} from './cvm/auth.js'
 import {CommunityAccess} from './community/service.js'
+import {ServiceInfrastructure} from './infrastructure.js'
+import {acceptJobEvidence} from './dispatch/status.js'
 import {RelayAuthorityTransport} from './community/transport.js'
 import type {WatcherConfig} from './config.js'
 import type {WatcherDb} from './db/index.js'
@@ -90,6 +92,10 @@ export class Watcher {
   readonly nostr: NostrClient
   readonly communities: CommunityAccess
   readonly authorizer: Authorizer
+  readonly infrastructure: ServiceInfrastructure
+  private readonly workerSubscriptions = new Map<string, Subscription[]>()
+  private readonly jobSubscriptions = new Map<string, Subscription>()
+  private readonly runnerProbes = new Set<Promise<void>>()
   private readonly authorityTransport: RelayAuthorityTransport
 
   private readonly repos = new Map<string, RepoWatch>()
@@ -116,9 +122,13 @@ export class Watcher {
     private readonly db: WatcherDb,
     private readonly identity: WatcherIdentity,
   ) {
-    this.nostr = new NostrClient(config.relays)
+    this.nostr = new NostrClient(config.relays, config.identityDiscoveryRelays, {signEvent: async event => identity.sign(event)})
     this.authorityTransport = new RelayAuthorityTransport(this.nostr.pool)
     this.communities = new CommunityAccess(config.communityAccess, this.authorityTransport, db)
+    this.infrastructure = new ServiceInfrastructure(config.infrastructure, this.communities)
+    this.internal.push(this.infrastructure.routes$.subscribe(routes => {
+      this.nostr.defaults$.next(normalizeRelays([...routes.inbox, ...routes.outbox]))
+    }))
     this.authorizer = new Authorizer(db, config.ownerPubkey, this.communities)
   }
 
@@ -145,25 +155,18 @@ export class Watcher {
         }
         this.workers = next
       }),
+      this.nostr.store.timeline({kinds: [30100, 5101]}).subscribe(events => {
+        for (const event of events) acceptJobEvidence(this.db, event)
+      }),
     )
 
-    // Relays replay the latest 30618 for every followed repo the moment we
-    // subscribe. Learn the runner pool first — wait for every default relay
-    // to EOSE the worker request, bounded — so the first evaluation does not
-    // see an empty pool.
-    const ads = await this.nostr.requestAll(
-      this.nostr.defaults,
-      {kinds: [KIND_LOOM_WORKER]},
-      WORKER_DISCOVERY_TIMEOUT_MS,
-      'workers:discovery',
-    )
-    log.info('worker discovery complete', {ads: ads.length, workers: this.workers.size})
-    if (!this.running) return
-
-    this.internal.push(this.nostr.subscribe(this.nostr.defaults$, {kinds: [KIND_LOOM_WORKER]}, 'workers'))
-
+    // Resolve approved runner identities before evaluating repository baselines.
     await communityStartup
     if (!this.running) return
+    await this.refreshRunners()
+    if (!this.running) return
+    this.monitorJobs()
+    log.info('worker discovery complete', {workers: this.workers.size, approved: this.db.listRunnerPool().length})
     this.readyForRepos = true
     await this.reconcileAccess()
 
@@ -192,8 +195,14 @@ export class Watcher {
     }
     this.repos.clear()
     for (const sub of this.internal) sub.unsubscribe()
+    for (const subs of this.workerSubscriptions.values()) for (const sub of subs) sub.unsubscribe()
+    this.workerSubscriptions.clear()
+    for (const sub of this.jobSubscriptions.values()) sub.unsubscribe()
+    this.jobSubscriptions.clear()
+    this.infrastructure.close()
     await Promise.allSettled([...this.repoQueues.values()])
     await this.schedulePending
+    await Promise.allSettled([...this.runnerProbes])
     await Promise.allSettled(watches.map(watch => watch.baselinePending))
     this.nostr.close()
   }
@@ -208,12 +217,69 @@ export class Watcher {
       followedRepos: visible.size,
       knownWorkers: this.workers.size,
       runnerPool: this.db.listRunnerPool().length,
-      recentRuns: this.db.recentRuns(5000).filter(run => visible.has(run.repoAddr)).slice(0, 10),
+      recentRuns: this.db.recentRuns(5000).filter(run => visible.has(run.repoAddr)).slice(0, 10).map(run => {
+        const job = this.db.jobs().find(job => job.runId === run.runId)
+        return {...run, ...(job ? {job: {...job, state: job.state === 'published' && Date.now() / 1000 - job.updatedAt > 120 ? 'unconfirmed' : job.state}} : {})}
+      }),
     }
   }
 
   knownWorkers(): Map<string, LoomWorker> {
     return this.workers
+  }
+
+  /** Retain in-flight monitoring at the routes captured before job publication. */
+  private monitorJobs(): void {
+    const jobs = this.db.jobs().filter(job => !['completed', 'failed'].includes(job.state))
+    const active = new Set(jobs.map(job => job.jobId))
+    for (const [id, sub] of this.jobSubscriptions) if (!active.has(id)) { sub.unsubscribe(); this.jobSubscriptions.delete(id) }
+    for (const job of jobs) if (!this.jobSubscriptions.has(job.jobId)) {
+      const routes$ = combineLatest([this.nostr.outboxes$(job.runnerPubkey), this.infrastructure.routes$]).pipe(
+        map(([current, own]) => normalizeRelays([...job.outboxes, ...current, ...own.inbox])),
+      )
+      this.jobSubscriptions.set(job.jobId, this.nostr.subscribe(routes$,
+        {kinds: [30100, 5101], authors: [job.runnerPubkey], '#e': [job.jobId]}, `job:${job.jobId}`))
+    }
+    // Status may arrive in the store between publication and subscription setup.
+    for (const event of this.nostr.store.getTimeline({kinds: [30100, 5101]})) acceptJobEvidence(this.db, event)
+  }
+
+  /** Discover only operator-selected identities; provenance is not an inferred mailbox. */
+  refreshRunners(probePubkeys?: string[]): Promise<void> {
+    const pending = this.probeRunners(probePubkeys)
+    this.runnerProbes.add(pending)
+    void pending.finally(() => this.runnerProbes.delete(pending)).catch(() => {})
+    return pending
+  }
+
+  private async probeRunners(probePubkeys?: string[]): Promise<void> {
+    const allowed = this.db.listRunnerPool().map(r => r.pubkey)
+    for (const [pubkey, subs] of this.workerSubscriptions) if (!allowed.includes(pubkey)) {
+      for (const sub of subs) sub.unsubscribe()
+      this.workerSubscriptions.delete(pubkey)
+    }
+    for (const pubkey of allowed) {
+      if (!this.running) return
+      if (!this.workerSubscriptions.has(pubkey)) {
+        const lookup$ = this.nostr.defaults$.pipe(map(relays => normalizeRelays([...relays, ...this.config.identityDiscoveryRelays])))
+        this.workerSubscriptions.set(pubkey, [
+          this.nostr.subscribe(lookup$, {kinds: [10002], authors: [pubkey]}, `worker-mailboxes:${pubkey}`),
+          this.nostr.subscribe(this.nostr.outboxes$(pubkey), {kinds: [KIND_LOOM_WORKER], authors: [pubkey]}, `worker:${pubkey}`),
+        ])
+      }
+    }
+    // Bound startup work in batches. Recurring subscriptions carry later metadata.
+    const probe = probePubkeys === undefined ? allowed : allowed.filter(pubkey => probePubkeys.includes(pubkey))
+    for (let offset = 0; offset < probe.length && this.running; offset += 4) {
+      await Promise.all(probe.slice(offset, offset + 4).map(async pubkey => {
+        await this.nostr.requestAll(normalizeRelays([...this.nostr.defaults, ...this.config.identityDiscoveryRelays]),
+          {kinds: [10002], authors: [pubkey]}, WORKER_DISCOVERY_TIMEOUT_MS, `worker-mailboxes:${pubkey}`)
+        if (!this.running) return
+        const relays = await firstOutboxes(this.nostr, pubkey)
+        if (this.running && relays.length) await this.nostr.requestAll(relays, {kinds: [KIND_LOOM_WORKER], authors: [pubkey]},
+          WORKER_DISCOVERY_TIMEOUT_MS, `worker:${pubkey}`)
+      }))
+    }
   }
 
   /** What the follow-time probe found, for `list_followed`. */
@@ -312,10 +378,9 @@ export class Watcher {
   /**
    * Wires one repo as a set of streams:
    *
-   * - announcement relays = defaults ∪ follower's hints ∪ owner's NIP-65 outboxes
-   * - state relays, per maintainer = the above ∪ the 30617's `relays` ∪ that
-   *   maintainer's own outboxes — one REQ per relay, authors narrowed to the
-   *   maintainers known to publish there
+   * - announcement relays = discovery seeds ∪ hints ∪ owner's outboxes
+   * - state relays = only the accepted 30617's `relays`, with authors narrowed
+   *   to the announcement's maintainers
    *
    * Every input is an observable; a maintainer added to the 30617, or a 10002
    * arriving late, reshapes the REQs without tearing anything down.
@@ -332,8 +397,8 @@ export class Watcher {
     const hints$ = new BehaviorSubject(hintRelays)
     const subscriptions: Subscription[] = []
 
-    const announcementRelays$ = combineLatest([hints$, this.nostr.outboxes$(owner)]).pipe(
-      map(([h, outboxes]) => mergeRelaySets(h, outboxes)),
+    const announcementRelays$ = combineLatest([hints$, this.nostr.outboxes$(owner), this.infrastructure.routes$]).pipe(
+      map(([h, outboxes, routes]) => mergeRelaySets(h, outboxes, routes.git, this.config.gitDiscoveryRelays)),
       distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
     )
 
@@ -363,23 +428,10 @@ export class Watcher {
       distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
     )
 
-    // relay → maintainers reachable there. Each maintainer's own outboxes are
-    // consulted (fetched lazily via the store loader when unknown), and every
-    // maintainer is also expected on the repo's relays and ours.
-    const outboxMap$ = combineLatest([maintainers$, repoRelays$, announcementRelays$, this.nostr.defaults$]).pipe(
-      switchMap(([maintainers, repoRelays, annRelays, defaults]) =>
-        combineLatest(
-          maintainers.map(pubkey =>
-            this.nostr.outboxes$(pubkey).pipe(
-              map(outboxes => ({
-                pubkey,
-                relays: this.nostr.liveness.filter(mergeRelaySets(defaults, annRelays, repoRelays, outboxes)),
-              })),
-            ),
-          ),
-        ),
-      ),
-      map(pointers => groupPubkeysByRelay(pointers)),
+    // Only repository-declared activity destinations; maintainer mailboxes and
+    // announcement discovery provenance must not widen this map.
+    const outboxMap$ = combineLatest([maintainers$, repoRelays$]).pipe(
+      map(([maintainers, relays]) => groupPubkeysByRelay(maintainers.map(pubkey => ({pubkey, relays})))),
     )
 
     subscriptions.push(
@@ -398,6 +450,21 @@ export class Watcher {
 
     const watch: RepoWatch = {repoAddr, owner, dTag, subscriptions, announcement$, probe: null, hints: hints$, baselineReady: false}
     this.repos.set(repoAddr, watch)
+
+    let scope: string | undefined
+    subscriptions.push(announcement$.subscribe(announcement => {
+      const next = JSON.stringify([announcement?.relays ?? [], announcement?.maintainers ?? []])
+      if (scope !== undefined && scope !== next) {
+        watch.baselineReady = false
+        watch.baselineController?.abort()
+        this.inflight.get(repoAddr)?.abort()
+        this.epochs.set(repoAddr, (this.epochs.get(repoAddr) ?? 0) + 1)
+        void (watch.baselinePending ?? Promise.resolve()).then(() => {
+          if (this.running && this.repos.get(repoAddr) === watch) return this.hydrateRepo(watch)
+        })
+      }
+      scope = next
+    }))
 
     void this.hydrateRepo(watch)
   }
@@ -420,7 +487,7 @@ export class Watcher {
       deadline = setTimeout(() => controller.abort(), 60000)
       const outboxes = await firstOutboxes(this.nostr, watch.owner)
       if (!current()) return
-      const relays = normalizeRelays(mergeRelaySets(this.nostr.defaults, watch.hints.value, outboxes))
+      const relays = normalizeRelays(mergeRelaySets(this.infrastructure.current.git, this.config.gitDiscoveryRelays, watch.hints.value, outboxes))
       const found = await this.authorityTransport.query(relays,
         {kinds: [KIND_REPO_ANNOUNCEMENT], authors: [watch.owner], '#d': [watch.dTag]}, controller.signal)
       if (!current()) return
@@ -428,11 +495,10 @@ export class Watcher {
       const announcement = this.currentAnnouncement(watch)
       const synchronizedAnnouncement = !!announcement && found.some(event => event.id === announcement.event.id)
       watch.probe = {checkedAt: Math.floor(Date.now() / 1000), found: synchronizedAnnouncement, relays}
-      if (!announcement || !synchronizedAnnouncement) return
+      if (!announcement || !synchronizedAnnouncement || !announcement.relays.length) return
       const synchronizedStates = new Set<string>()
       for (const maintainer of announcement.maintainers) {
-        const maintainerOutboxes = await firstOutboxes(this.nostr, maintainer)
-        const events = await this.authorityTransport.query(mergeRelaySets(relays, announcement.relays, maintainerOutboxes),
+        const events = await this.authorityTransport.query(announcement.relays,
           {kinds: [KIND_REPO_STATE], authors: [maintainer], '#d': [watch.dTag]}, controller.signal)
         if (!current()) return
         events.forEach(event => this.nostr.store.add(event))
@@ -523,7 +589,7 @@ export class Watcher {
     if (!watch?.baselineReady) return
 
     const announcement = this.currentAnnouncement(watch)
-    if (!announcement) {
+    if (!announcement || !announcement.relays.length) {
       log.debug('no announcement in store, deferring evaluation', {repoAddr})
       return
     }
@@ -662,7 +728,7 @@ export class Watcher {
         repoRelays: args.announcement.relays,
       })
       if (args.signal.aborted) return 'superseded'
-      if (outcome.status !== 'dispatched') completion = 'incomplete'
+      if (outcome.status !== 'dispatched' && outcome.status !== 'unconfirmed') completion = 'incomplete'
     }
     return completion
   }
@@ -670,12 +736,14 @@ export class Watcher {
   private async dispatch(request: DispatchRequest): Promise<DispatchOutcome> {
     const epoch = this.epochs.get(request.repoAddr) ?? 0
     let expired = false
+    let attempted: {runId: string; runnerPubkey: string} | undefined
     const deps = {
-      config: this.config,
+      config: {...this.config, blossomServers: this.infrastructure.current.blossom},
       db: this.db,
       identity: this.identity,
       nostr: this.nostr,
       workers: () => this.workers,
+      jobPrepared: (runId: string, runnerPubkey: string) => { attempted = {runId, runnerPubkey}; this.monitorJobs() },
       mayDispatch: () => !expired && this.running && this.isEligible(request.repoAddr) &&
         (this.epochs.get(request.repoAddr) ?? 0) === epoch &&
         !!this.db.getFollowedRepo(request.repoAddr)?.active && this.db.getFollowedRepo(request.repoAddr)?.seededAt != null,
@@ -685,7 +753,7 @@ export class Watcher {
       timer = setTimeout(
         () => {
           expired = true
-          resolve({status: 'failed', error: `dispatch exceeded ${DISPATCH_DEADLINE_MS} ms`})
+          resolve(attempted ? {status: 'unconfirmed', ...attempted} : {status: 'failed', error: `dispatch exceeded ${DISPATCH_DEADLINE_MS} ms`})
         },
         DISPATCH_DEADLINE_MS,
       )
@@ -816,6 +884,7 @@ export class Watcher {
 
   private async evaluateSchedules(nowMs: number): Promise<void> {
     this.scheduleTicks += 1
+    this.monitorJobs()
     for (const watch of this.repos.values()) if (!watch.baselineReady) void this.hydrateRepo(watch)
     if (this.scheduleTicks % RUNS_PRUNE_EVERY_TICKS === 0) {
       const pruned = this.db.pruneRuns()

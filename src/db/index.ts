@@ -48,6 +48,18 @@ export interface RunRow {
   createdAt: number
 }
 
+export interface RunJob {
+  runId: string
+  jobId: string
+  runnerPubkey: string
+  inboxes: string[]
+  outboxes: string[]
+  state: 'unconfirmed' | 'published' | 'queued' | 'running' | 'completed' | 'failed'
+  evidence: import('nostr-tools').NostrEvent | null
+  updatedAt: number
+  pendingEvaluation: boolean
+}
+
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
 }
@@ -99,6 +111,34 @@ export class WatcherDb {
 
   close(): void {
     this.db.close()
+  }
+
+  recordJob(job: Omit<RunJob, 'runnerPubkey' | 'evidence' | 'updatedAt' | 'pendingEvaluation'>): void {
+    this.db.prepare(`INSERT INTO run_jobs (run_id, job_id, inboxes, outboxes, state, pending_evaluation, updated_at)
+      VALUES (?, ?, ?, ?, ?, (SELECT trigger = 'push' FROM runs WHERE run_id = ?), ?)`)
+      .run(job.runId, job.jobId, JSON.stringify(job.inboxes), JSON.stringify(job.outboxes), job.state, job.runId, nowSeconds())
+  }
+
+  pendingRunFor(request: Pick<RunRow, 'repoAddr' | 'ref' | 'commitId' | 'workflowPath'>): Pick<RunRow, 'runId' | 'runnerPubkey'> | null {
+    const row = this.db.prepare(`SELECT r.run_id, r.runner_pubkey FROM runs r JOIN run_jobs j ON r.run_id = j.run_id
+      WHERE j.pending_evaluation = 1 AND r.trigger = 'push' AND r.repo_addr = ? AND r.ref = ? AND r.commit_id = ? AND r.workflow_path = ?
+      ORDER BY r.created_at DESC LIMIT 1`).get(request.repoAddr, request.ref, request.commitId, request.workflowPath) as {run_id: string; runner_pubkey: string} | undefined
+    return row ? {runId: row.run_id, runnerPubkey: row.runner_pubkey} : null
+  }
+
+  jobs(): RunJob[] {
+    return this.db.prepare(`SELECT j.*, r.runner_pubkey FROM run_jobs j JOIN runs r ON r.run_id = j.run_id`).all().map((row: any) => ({
+      runId: row.run_id, jobId: row.job_id, runnerPubkey: row.runner_pubkey,
+      inboxes: parseHints(row.inboxes), outboxes: parseHints(row.outboxes), state: row.state,
+      evidence: row.evidence ? JSON.parse(row.evidence) : null, updatedAt: row.updated_at, pendingEvaluation: !!row.pending_evaluation,
+    }))
+  }
+
+  updateJob(jobId: string, state: RunJob['state'], evidence?: import('nostr-tools').NostrEvent): void {
+    // Relay ACK can arrive after worker evidence; never demote an execution state.
+    this.db.prepare(`UPDATE run_jobs SET state = ?, evidence = COALESCE(?, evidence), updated_at = ? WHERE job_id = ?
+      ${evidence ? '' : "AND evidence IS NULL"}`)
+      .run(state, evidence ? JSON.stringify(evidence) : null, nowSeconds(), jobId)
   }
 
   // ── followed repos ──────────────────────────────────────────────────────
@@ -156,6 +196,7 @@ export class WatcherDb {
 
   setRepoActive(repoAddr: string, active: boolean): void {
     this.db.transaction(() => {
+      this.db.prepare(`UPDATE run_jobs SET pending_evaluation = 0 WHERE run_id IN (SELECT run_id FROM runs WHERE repo_addr = ?)`).run(repoAddr)
       this.db.prepare('UPDATE followed_repos SET active = ?, seeded_at = NULL WHERE repo_addr = ?').run(active ? 1 : 0, repoAddr)
       this.db.prepare('DELETE FROM ref_state WHERE repo_addr = ?').run(repoAddr)
       this.db.prepare('DELETE FROM schedules WHERE repo_addr = ?').run(repoAddr)
@@ -247,13 +288,17 @@ export class WatcherDb {
 
   /** Records a live ref, clearing any tombstone. */
   putRefState(repoAddr: string, ref: string, commitId: string): void {
-    this.db
-      .prepare(
-        `INSERT INTO ref_state (repo_addr, ref, commit_id, updated_at, deleted_at) VALUES (?, ?, ?, ?, NULL)
-         ON CONFLICT(repo_addr, ref) DO UPDATE
-           SET commit_id = excluded.commit_id, updated_at = excluded.updated_at, deleted_at = NULL`,
-      )
-      .run(repoAddr, ref, commitId, nowSeconds())
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO ref_state (repo_addr, ref, commit_id, updated_at, deleted_at) VALUES (?, ?, ?, ?, NULL)
+           ON CONFLICT(repo_addr, ref) DO UPDATE
+             SET commit_id = excluded.commit_id, updated_at = excluded.updated_at, deleted_at = NULL`,
+        )
+        .run(repoAddr, ref, commitId, nowSeconds())
+      this.db.prepare(`UPDATE run_jobs SET pending_evaluation = 0 WHERE run_id IN (SELECT run_id FROM runs WHERE repo_addr = ? AND ref = ?)`)
+        .run(repoAddr, ref)
+    })()
   }
 
   /** Writes every ref of a first-seen repo in one transaction, without dispatching. */
@@ -352,13 +397,13 @@ export class WatcherDb {
       )
   }
 
-  /** Keeps the newest `keep` rows; the table is an audit tail, not a ledger. */
+  /** Keep the audit tail plus publication latches for unfinished evaluations. */
   pruneRuns(keep = 5000): number {
     return this.db
       .prepare(
         `DELETE FROM runs WHERE run_id IN (
            SELECT run_id FROM runs ORDER BY created_at DESC LIMIT -1 OFFSET ?
-         )`,
+          ) AND NOT EXISTS (SELECT 1 FROM run_jobs j WHERE j.run_id = runs.run_id AND j.pending_evaluation = 1)`,
       )
       .run(keep).changes
   }

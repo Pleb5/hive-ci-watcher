@@ -3,27 +3,16 @@ import {dirname} from 'node:path'
 import {generateSecretKey, nip19} from 'nostr-tools'
 import {normalizeRelays} from './nostr/relays.js'
 import {loadCommunityConfig, type CommunityConfig} from './community/config.js'
+import {endpointList, IDENTITY_DISCOVERY_RELAYS, GIT_DISCOVERY_RELAYS, SERVICE_DISCOVERY_RELAYS, type InfrastructureOverrides} from './infrastructure.js'
 
 export {normalizeRelays}
 
-export const DEFAULT_RELAYS = [
-  'wss://relay.budabit.club',
-  'wss://nos.lol',
-  'wss://relay.damus.io',
-]
+export const DEFAULT_RELAYS: string[] = []
 
-/**
- * ContextVM's own relays. The CVM server listens here as well as on the
- * defaults, announces here, and retracts here; the CLI reaches the daemon
- * here. Not used for repo watching or run publishing.
- */
-export const CVM_RELAYS = ['wss://relay.contextvm.org', 'wss://relay2.contextvm.org']
+/** ContextVM discovery seeds, independent of operational inboxes/outboxes. */
+export const CVM_RELAYS = SERVICE_DISCOVERY_RELAYS
 
-export const DEFAULT_BLOSSOM_SERVERS = [
-  'https://blossom.budabit.club',
-  'https://blossom.primal.net',
-  'https://cdn.sovbit.host',
-]
+export const DEFAULT_BLOSSOM_SERVERS: string[] = []
 
 export interface WatcherConfig {
   /** Watcher secret key, 64 hex chars. */
@@ -42,7 +31,7 @@ export interface WatcherConfig {
   ownerPubkey: string
   databasePath: string
   relays: string[]
-  /** Where the ContextVM server listens and announces: `relays` ∪ `CVM_RELAYS`. */
+  /** Legacy initial inbox projection; live transports use ServiceInfrastructure. */
   cvmRelays: string[]
   /** Ordered; the first server that answers wins. */
   blossomServers: string[]
@@ -52,6 +41,10 @@ export interface WatcherConfig {
    */
   fetchRetryWindowMs: number
   communityAccess: CommunityConfig
+  infrastructure: InfrastructureOverrides
+  identityDiscoveryRelays: string[]
+  gitDiscoveryRelays: string[]
+  serviceDiscoveryRelays: string[]
 }
 
 const HEX64 = /^[0-9a-f]{64}$/i
@@ -116,20 +109,22 @@ export function resolveSecretKey(env: NodeJS.ProcessEnv): Pick<WatcherConfig, 's
   return {secretKeyHex: freshSecretKeyHex(), keySource: 'generated'}
 }
 
-function splitList(raw: string | undefined, fallback: string[]): string[] {
-  if (!raw) return [...fallback]
-  const items = raw
-    .split(',')
-    .map(item => item.trim())
-    .filter(Boolean)
-  return items.length > 0 ? items : [...fallback]
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig {
   const owner = env.HIVE_CI_WATCHER_OWNER_PUBKEY
   if (!owner) throw new Error('HIVE_CI_WATCHER_OWNER_PUBKEY is required')
 
   const communityAccess = loadCommunityConfig(env.HIVE_CI_WATCHER_COMMUNITIES_FILE)
+  const legacy = endpointList(env.HIVE_CI_WATCHER_RELAYS)
+  const infrastructure = {
+    inbox: endpointList(env.HIVE_CI_WATCHER_INBOX_RELAYS) ?? legacy,
+    outbox: endpointList(env.HIVE_CI_WATCHER_OUTBOX_RELAYS) ?? legacy,
+    blossom: endpointList(env.HIVE_CI_WATCHER_BLOSSOM_SERVERS, true),
+  }
+  for (const role of ['inbox', 'outbox'] as const) {
+    if (infrastructure[role]?.length === 0 || (!communityAccess.communities.length && !infrastructure[role]?.length)) {
+      throw new Error(`configure HIVE_CI_WATCHER_${role.toUpperCase()}_RELAYS (or RELAYS); alternatively configure an optional community source`)
+    }
+  }
   const key = resolveSecretKey(env)
 
   return {
@@ -138,11 +133,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig 
     ...(key.keyFile ? {keyFile: key.keyFile} : {}),
     ownerPubkey: normalizePubkey(owner, 'HIVE_CI_WATCHER_OWNER_PUBKEY'),
     databasePath: env.HIVE_CI_WATCHER_DB?.trim() || './watcher.db',
-    relays: normalizeRelays(splitList(env.HIVE_CI_WATCHER_RELAYS, DEFAULT_RELAYS)),
-    cvmRelays: normalizeRelays([...splitList(env.HIVE_CI_WATCHER_RELAYS, DEFAULT_RELAYS), ...CVM_RELAYS]),
-    blossomServers: splitList(env.HIVE_CI_WATCHER_BLOSSOM_SERVERS, DEFAULT_BLOSSOM_SERVERS).map(
-      server => server.replace(/\/+$/, ''),
-    ),
+    relays: normalizeRelays([...(infrastructure.inbox ?? []), ...(infrastructure.outbox ?? [])]),
+    cvmRelays: infrastructure.inbox ?? [],
+    blossomServers: infrastructure.blossom ?? [],
+    infrastructure,
+    identityDiscoveryRelays: endpointList(env.HIVE_CI_WATCHER_IDENTITY_DISCOVERY_RELAYS) ?? IDENTITY_DISCOVERY_RELAYS,
+    gitDiscoveryRelays: endpointList(env.HIVE_CI_WATCHER_GIT_DISCOVERY_RELAYS) ?? GIT_DISCOVERY_RELAYS,
+    serviceDiscoveryRelays: endpointList(env.HIVE_CI_WATCHER_SERVICE_DISCOVERY_RELAYS) ?? SERVICE_DISCOVERY_RELAYS,
     fetchRetryWindowMs: parseSeconds(env.HIVE_CI_WATCHER_FETCH_RETRY_WINDOW, 600) * 1000,
     communityAccess,
   }

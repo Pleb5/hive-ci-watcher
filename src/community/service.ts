@@ -95,6 +95,11 @@ export class CommunityAccess {
     return [...members].sort(([a], [b]) => a.localeCompare(b)).map(([pubkey, communities]) => ({pubkey, communities}))
   }
 
+  /** Accepted definitions, including verified persisted transport metadata. Not authorization. */
+  definitions() {
+    return [...this.branches.values()].flatMap(branch => branch.view.definition ? [branch.view.definition] : [])
+  }
+
   checkFreshness(): void {
     let changed = false
     for (const branch of this.branches.values()) {
@@ -146,7 +151,7 @@ export class CommunityAccess {
       release = await this.transport.admit(controller.signal)
       const started = this.now()
       deadline = setTimeout(() => controller.abort(), 60000)
-      apply(await this.transport.query(branch.source.relays, definitionFilter, controller.signal))
+      apply(await this.transport.query([...new Set([...branch.source.relays, ...(branch.view.definition?.relays ?? [])])], definitionFilter, controller.signal))
       const definitionId = branch.view.definition?.event.id
       const refs = branch.view.refs()
       const relays = [...new Set([...branch.source.relays, ...(branch.view.definition?.relays ?? []), ...refs.flatMap(ref => ref.relay ? [ref.relay] : [])])]

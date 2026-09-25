@@ -42,16 +42,12 @@ export interface DispatchDeps {
   workers: () => Map<string, LoomWorker>
   /** Rechecked after asynchronous work, immediately before either publication. */
   mayDispatch: () => boolean
+  jobPrepared?: (runId: string, runnerPubkey: string) => void
 }
 
-/**
- * Where a run's 5401/5100 go: our defaults ∪ the repo's own relays. Workers
- * advertise no relay hints on their 10100 (checked), so the defaults are the
- * set they are assumed to listen on; the repo's relays are where its readers
- * look for runs. Acceptance is required from at least two of them.
- */
-export function publishRelaysFor(config: WatcherConfig, repoRelays: string[]): string[] {
-  return normalizeRelays([...config.relays, ...repoRelays])
+/** Repository reporting is scoped to the accepted announcement, not worker delivery. */
+export function publishRelaysFor(_config: WatcherConfig, repoRelays: string[]): string[] {
+  return normalizeRelays(repoRelays)
 }
 
 const MIN_ACCEPTING_RELAYS = 2
@@ -61,6 +57,7 @@ export type DispatchOutcome =
   | {status: 'no-runner'}
   | {status: 'failed'; error: string}
   | {status: 'inactive'}
+  | {status: 'unconfirmed'; runId: string; runnerPubkey: string}
 
 function hexFromBytes(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('hex')
@@ -79,15 +76,14 @@ function readCursor(db: WatcherDb): number {
  *
  * The 5100 carries no `payment` tag. Selection does not consult the worker's
  * advertised price: pool membership is the operator asserting that the watcher
- * is on that worker's `ALLOW_UNPAID_PUBKEYS`, which is the only thing that
+ * is on that worker's configured Nostr freelist, which is the thing that
  * makes an unpaid job run.
  *
  * **No user secrets.** Watcher-triggered runs carry only `HIVE_CI_NSEC`; a
  * workflow needing repository secrets will not work under a watcher in v1.
  *
- * There are no retries. A failure is logged and dropped — the caller still
- * writes the new commit into `ref_state`, so a dropped dispatch is not
- * replayed on the next 30618 for an unrelated ref.
+ * Pre-publication failures may be retried by evaluation. Once job publication
+ * is attempted, a missing ACK is unconfirmed and must not create another job.
  */
 export async function dispatchRun(
   deps: DispatchDeps,
@@ -95,6 +91,12 @@ export async function dispatchRun(
 ): Promise<DispatchOutcome> {
   const {config, db, identity, nostr} = deps
   if (!deps.mayDispatch()) return {status: 'inactive'}
+  // Once a job publication was attempted, retries need a separate execution
+  // policy. In particular a missing relay OK does not prove the job was lost.
+  if (request.trigger === 'push') {
+    const prior = db.pendingRunFor(request)
+    if (prior) return {status: 'unconfirmed', runId: prior.runId, runnerPubkey: prior.runnerPubkey}
+  }
 
   const allowed = db.listRunnerPool().map(entry => entry.pubkey)
   const eligible = eligibleRunners({allowed, workers: deps.workers()})
@@ -113,8 +115,16 @@ export async function dispatchRun(
   // dispatch should not be handed the next run as well.
   db.setKv(CURSOR_KEY, String(choice.nextCursor))
   const runnerPubkey = choice.selected.pubkey
+  let attemptedRunId: string | undefined
 
   try {
+    const relayList = await nostr.loadReplaceable({kind: 10002, pubkey: runnerPubkey})
+    // Both directions belong to one signed routing snapshot.
+    const inboxes = normalizeRelays(relayList?.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'read')).map(t => t[1]!) ?? [])
+    const outboxes = normalizeRelays(relayList?.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]!) ?? [])
+    if (!inboxes.length || !outboxes.length) throw new Error('selected worker inbox/outbox unresolved')
+    if (!request.repoRelays.length) throw new Error('repository reporting relays unresolved')
+    if (!config.blossomServers.length) throw new Error('runner artifact routing unavailable: configure Blossom or a community source')
     const scriptUrl = await resolveRunnerScriptUrl({
       db,
       identity,
@@ -166,8 +176,6 @@ export async function dispatchRun(
     )
 
     if (!deps.mayDispatch()) return {status: 'inactive'}
-    const jobPublish = await nostr.publish(publishRelays, jobEvent, MIN_ACCEPTING_RELAYS)
-
     db.recordRun({
       runId,
       repoAddr: request.repoAddr,
@@ -178,6 +186,11 @@ export async function dispatchRun(
       trigger: request.trigger,
       createdAt: runEvent.created_at,
     })
+    db.recordJob({runId, jobId: jobEvent.id, inboxes, outboxes, state: 'unconfirmed'})
+    attemptedRunId = runId
+    deps.jobPrepared?.(runId, runnerPubkey)
+    const jobPublish = await nostr.publish(inboxes, jobEvent, 1)
+    db.updateJob(jobEvent.id, 'published')
 
     log.info('run dispatched', {
       runId,
@@ -199,6 +212,6 @@ export async function dispatchRun(
       ref: request.ref,
       error,
     })
-    return {status: 'failed', error}
+    return attemptedRunId ? {status: 'unconfirmed', runId: attemptedRunId, runnerPubkey} : {status: 'failed', error}
   }
 }

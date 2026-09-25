@@ -1,6 +1,9 @@
 import {describe, expect, it} from 'vitest'
 import {getPublicKey} from 'nostr-tools'
-import {loadConfig} from '../src/config.js'
+import {loadConfig as load} from '../src/config.js'
+
+// Key lifecycle tests supply a standalone transport explicitly.
+const loadConfig = (env: NodeJS.ProcessEnv) => load({HIVE_CI_WATCHER_RELAYS: 'wss://service.example', ...env})
 
 const OWNER = 'a'.repeat(64)
 

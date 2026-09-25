@@ -308,6 +308,6 @@ describe('relay url normalisation', () => {
         '',
         null,
       ]),
-    ).toEqual(['wss://nos.lol/', 'wss://relay.example.com:4443/path'])
+    ).toEqual(['wss://nos.lol', 'wss://relay.example.com:4443/path'])
   })
 })

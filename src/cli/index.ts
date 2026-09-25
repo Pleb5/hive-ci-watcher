@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 import '../env-defaults.js'
 import {EncryptionMode, GiftWrapMode} from '@contextvm/sdk/core'
-import {ApplesauceRelayPool} from '@contextvm/sdk/relay'
 import {NostrClientTransport} from '@contextvm/sdk/transport'
 import {Client} from '@contextvm/mcp-sdk/client/index.js'
-import {CVM_RELAYS, DEFAULT_RELAYS, normalizePubkey, normalizeRelays} from '../config.js'
+import {normalizePubkey, normalizeRelays} from '../config.js'
+import {endpointList, IDENTITY_DISCOVERY_RELAYS, SERVICE_DISCOVERY_RELAYS} from '../infrastructure.js'
+import {NostrClient} from '../nostr/client.js'
+import {DirectedRelayHandler} from '../cvm/relay-handler.js'
+import {of} from 'rxjs'
 import {errorMessage} from '../log.js'
 import {loadCliSigner} from './signer.js'
 
@@ -86,16 +89,30 @@ async function main(): Promise<void> {
   if (!serverPubkey) throw new Error('HIVE_CI_WATCHER_PUBKEY is required')
   await signer.getPublicKey()
 
-  const relays = normalizeRelays([
-    ...(process.env.HIVE_CI_WATCHER_RELAYS || DEFAULT_RELAYS.join(',')).split(','),
-    ...CVM_RELAYS,
+  const target = normalizePubkey(serverPubkey, 'HIVE_CI_WATCHER_PUBKEY')
+  const discovery = normalizeRelays([
+    ...(endpointList(process.env.HIVE_CI_WATCHER_IDENTITY_DISCOVERY_RELAYS) ?? IDENTITY_DISCOVERY_RELAYS),
+    ...(endpointList(process.env.HIVE_CI_WATCHER_SERVICE_DISCOVERY_RELAYS) ?? SERVICE_DISCOVERY_RELAYS),
   ])
-
-  const relayPool = new ApplesauceRelayPool(relays)
+  const explicit = endpointList(process.env.HIVE_CI_WATCHER_RELAYS)
+  const nostr = new NostrClient(explicit ?? [], discovery, signer)
+  let inbox: string[], outbox: string[]
+  try {
+    if (explicit !== undefined) inbox = outbox = explicit
+    else {
+      await nostr.requestAll(discovery, {kinds: [10002], authors: [target]}, 8000, 'watcher-mailboxes')
+      const list = nostr.store.getReplaceable(10002, target)
+      inbox = normalizeRelays(list?.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'read')).map(t => t[1]!) ?? [])
+      outbox = normalizeRelays(list?.tags.filter(t => t[0] === 'r' && (!t[2] || t[2] === 'write')).map(t => t[1]!) ?? [])
+    }
+    if (!inbox.length || !outbox.length) throw new Error('watcher inbox/outbox unresolved; supply an explicit HIVE_CI_WATCHER_RELAYS override or publish its signed NIP-65 list')
+  } catch (error) { nostr.close(); throw error }
+  const relayPool = new DirectedRelayHandler(nostr, of(outbox), () => inbox, () => normalizeRelays([...inbox, ...outbox]))
   const transport = new NostrClientTransport({
     signer,
     relayHandler: relayPool,
-    serverPubkey: normalizePubkey(serverPubkey, 'HIVE_CI_WATCHER_PUBKEY'),
+    discoveryRelayUrls: [],
+    serverPubkey: target,
     encryptionMode: EncryptionMode.REQUIRED,
     giftWrapMode: GiftWrapMode.EPHEMERAL,
   })
@@ -119,6 +136,7 @@ async function main(): Promise<void> {
   } finally {
     await client.close().catch(() => undefined)
     await relayPool.disconnect().catch(() => undefined)
+    nostr.close()
   }
 }
 

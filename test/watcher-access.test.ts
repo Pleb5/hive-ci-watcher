@@ -24,7 +24,8 @@ afterEach(async () => {
 
 function setup() {
   const db = new WatcherDb(':memory:')
-  const config = loadConfig({HIVE_CI_WATCHER_OWNER_PUBKEY: OWNER})
+  const config = loadConfig({HIVE_CI_WATCHER_OWNER_PUBKEY: OWNER,
+    HIVE_CI_WATCHER_RELAYS: 'wss://service.example', HIVE_CI_WATCHER_BLOSSOM_SERVERS: 'https://blossom.example'})
   const watcher = new Watcher(config, db, new WatcherIdentity(config.secretKeyHex))
   const internal = watcher as any
   internal.running = true
@@ -35,10 +36,14 @@ function setup() {
   db.addRunner(OTHER)
   internal.workers.set(OTHER, {pubkey: OTHER, name: 'worker', description: '', mints: [], lastSeen: Math.floor(Date.now() / 1000)})
   const publish = vi.spyOn(watcher.nostr, 'publish').mockResolvedValue({accepted: ['wss://one', 'wss://two'], rejected: []})
+  vi.spyOn(watcher.nostr, 'loadReplaceable').mockResolvedValue(event(10002,
+    [['r', 'wss://worker-outbox.example', 'write'], ['r', 'wss://worker-inbox.example', 'read']], 4))
+  vi.spyOn(watcher.nostr, 'subscribe').mockImplementation(() => new Subscription())
+  vi.spyOn(watcher.nostr, 'outboxes$').mockReturnValue(of([]))
   cleanups.push(async () => { await watcher.stop(); db.close() })
   return {db, watcher, internal, publish}
 }
-const request = {repoAddr: REPO, workflowPath: '.github/workflows/test.yml', trigger: 'push', ref: REF, branch: 'main', commitId: COMMIT, repoRelays: []}
+const request = {repoAddr: REPO, workflowPath: '.github/workflows/test.yml', trigger: 'push', ref: REF, branch: 'main', commitId: COMMIT, repoRelays: ['wss://repo.example']}
 
 describe('eligibility at submission boundaries', () => {
   it('refuses dispatch without any eligible registration', async () => {
@@ -85,7 +90,7 @@ describe('eligibility at submission boundaries', () => {
 describe('activation and suspension', () => {
   it('can bootstrap a genuinely new repository after an empty completed state query', async () => {
     const {db, watcher, internal, publish} = setup()
-    const announcement = event(30617, [['d', 'test'], ['clone', 'https://git.example/repo']])
+    const announcement = event(30617, [['d', 'test'], ['relays', 'wss://repo.example'], ['clone', 'https://git.example/repo']])
     db.setRepoActive(REPO, true)
     const watch = {repoAddr: REPO, owner: OWNER, dTag: 'test', subscriptions: [], hints: new BehaviorSubject([]), baselineReady: false}
     internal.repos.set(REPO, watch)
@@ -103,7 +108,7 @@ describe('activation and suspension', () => {
   })
   it.each([30617, 30618])('does not validate cached baseline evidence with an empty kind-%s response', async missingKind => {
     const {db, watcher, internal, publish} = setup()
-    const announcement = event(30617, [['d', 'test'], ['clone', 'https://git.example/repo']])
+    const announcement = event(30617, [['d', 'test'], ['relays', 'wss://repo.example'], ['clone', 'https://git.example/repo']])
     const oldState = event(30618, [['d', 'test'], [REF, COMMIT]])
     const suspendedState = event(30618, [['d', 'test'], [REF, '2'.repeat(40)]], 1, 1001)
     watcher.nostr.store.add(announcement)
@@ -200,7 +205,7 @@ describe('activation and suspension', () => {
   it('first evaluation after resume seeds the current commit instead of dispatching past changes', async () => {
     const {db, watcher, internal, publish} = setup()
     const commit = '2'.repeat(40)
-    watcher.nostr.store.add(event(30617, [['d', 'test'], ['clone', 'https://git.example/repo']]))
+    watcher.nostr.store.add(event(30617, [['d', 'test'], ['relays', 'wss://repo.example'], ['clone', 'https://git.example/repo']]))
     watcher.nostr.store.add(event(30618, [['d', 'test'], [REF, commit], ['HEAD', 'ref: refs/heads/main']]))
     internal.repos.set(REPO, {repoAddr: REPO, owner: OWNER, dTag: 'test', subscriptions: [], hints: {complete() {}}, baselineReady: true})
     db.setRepoActive(REPO, true)
@@ -212,7 +217,7 @@ describe('activation and suspension', () => {
   })
   it('waits for a fresh baseline before using cached state and seeds the synchronized commit', async () => {
     const {db, watcher, internal, publish} = setup()
-    const announcement = event(30617, [['d', 'test'], ['clone', 'https://git.example/repo']])
+    const announcement = event(30617, [['d', 'test'], ['relays', 'wss://repo.example'], ['clone', 'https://git.example/repo']])
     const state = (commit: string, time: number) => event(30618, [['d', 'test'], [REF, commit]], 1, time)
     watcher.nostr.store.add(announcement)
     watcher.nostr.store.add(state(COMMIT, 1000))
@@ -251,7 +256,7 @@ describe('activation and suspension', () => {
     await watcher.reconcileAccess()
     expect(announcements).toHaveBeenCalledTimes(1)
     expect(states).toHaveBeenCalledTimes(1)
-    expect(internal.repos.get(REPO).hints.value).toContain('wss://relay.example.com/')
+    expect(internal.repos.get(REPO).hints.value).toContain('wss://relay.example.com')
     db.removeRegistration(REPO, MEMBER)
     await watcher.reconcileAccess()
     expect(internal.repos.size).toBe(1)
@@ -271,7 +276,7 @@ describe('activation and suspension', () => {
   })
   it('drops the rest of a due schedule batch after suspension, even if access returns', async () => {
     const {db, watcher, internal, publish} = setup()
-    watcher.nostr.store.add(event(30617, [['d', 'test'], ['clone', 'https://git.example/repo']]))
+    watcher.nostr.store.add(event(30617, [['d', 'test'], ['relays', 'wss://repo.example'], ['clone', 'https://git.example/repo']]))
     internal.repos.set(REPO, {repoAddr: REPO, owner: OWNER, dTag: 'test', subscriptions: [], hints: new BehaviorSubject([]), baselineReady: true})
     db.replaceSchedules(REPO, ['one.yml', 'two.yml'].map(workflowPath => ({workflowPath, cron: '* * * * *'})))
     for (const path of ['one.yml', 'two.yml']) db.markScheduleFired(REPO, path, 1)

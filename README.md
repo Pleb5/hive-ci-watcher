@@ -29,8 +29,9 @@ is on workers' freelists and in repos' 30620 lists, since both are keyed by it
   boot (mode 0600), read back on every later one; or
 - `HIVE_CI_WATCHER_NSEC=…` — a key you manage yourself. Takes precedence.
 
-Whichever way, the watcher pubkey must be present in each loom worker's
-`ALLOW_UNPAID_PUBKEYS`. That is added out of band — nothing here automates it.
+Whichever way, the watcher pubkey must be present in each Loom worker's
+Nostr freelist (`freelist.enabled: true`, with `freelist.event_id` referencing
+the list). The worker operator maintains that list.
 
 ## Configuration
 
@@ -41,12 +42,40 @@ Whichever way, the watcher pubkey must be present in each loom worker's
 | `HIVE_CI_WATCHER_OWNER_PUBKEY` | yes | — |
 | `HIVE_CI_WATCHER_DB` | no | `./watcher.db` |
 | `HIVE_CI_WATCHER_COMMUNITIES_FILE` | no | — (operator and explicit grants only) |
-| `HIVE_CI_WATCHER_RELAYS` | no | `wss://relay.budabit.club,wss://nos.lol,wss://relay.damus.io` |
-| `HIVE_CI_WATCHER_BLOSSOM_SERVERS` | no | `https://blossom.budabit.club,https://blossom.primal.net,https://cdn.sovbit.host` |
+| `HIVE_CI_WATCHER_RELAYS` | standalone shorthand | — (explicit service inbox + outbox) |
+| `HIVE_CI_WATCHER_INBOX_RELAYS` | standalone, unless shorthand supplied | — (otherwise community-derived) |
+| `HIVE_CI_WATCHER_OUTBOX_RELAYS` | standalone, unless shorthand supplied | — (otherwise community-derived) |
+| `HIVE_CI_WATCHER_BLOSSOM_SERVERS` | needed for dispatch | — (otherwise community-derived) |
+| `HIVE_CI_WATCHER_IDENTITY_DISCOVERY_RELAYS` | no | `wss://purplepag.es` |
+| `HIVE_CI_WATCHER_GIT_DISCOVERY_RELAYS` | no | `wss://index.ngit.dev` |
+| `HIVE_CI_WATCHER_SERVICE_DISCOVERY_RELAYS` | no | `wss://relay.contextvm.org,wss://relay2.contextvm.org` |
 | `HIVE_CI_WATCHER_FETCH_RETRY_WINDOW` | no | `600` (seconds; state events precede object uploads, so the remote is polled) |
 | `HIVE_CI_WATCHER_LOG_LEVEL` | no | `info` |
 
 When given, the nsec is read in plaintext for v1; NIP-49 is deferred.
+
+Community configuration is **optional**. A standalone deployment supplies its
+operational endpoints explicitly, for example:
+
+```sh
+HIVE_CI_WATCHER_INBOX_RELAYS=wss://inbox.example.com
+HIVE_CI_WATCHER_OUTBOX_RELAYS=wss://outbox.example.com
+HIVE_CI_WATCHER_BLOSSOM_SERVERS=https://blossom.example.com
+```
+
+With communities configured, omit a role's explicit setting to derive it from
+the accepted definitions. Precedence is per-role override > explicitly supplied
+`RELAYS` shorthand > community infrastructure. An empty optional discovery list
+disables that path. Empty operational lists are configuration errors. Missing
+Blossom routes disable artifact-dependent dispatch rather than selecting an
+unrelated upload host. Damus and Primal are not defaults; explicitly configured
+or advertised use is permitted.
+
+Identity, repository-announcement, and watcher discovery are separate roles.
+Jobs go to the selected worker's signed NIP-65 **inboxes**. Worker capabilities
+and status come from its **outboxes**. Repository state and Hive `5401`/`5402`
+reporting use the accepted repository announcement's `relays` only.
+See [routing and migration](docs/routing.md) for live updates and failure behavior.
 
 ### Community-derived access
 
@@ -71,8 +100,10 @@ small pilot; it limits the daemon to one CPU and 1.5 GiB RAM.
 ## CLI
 
 The CLI is a thin ContextVM client — every subcommand is one tool call against
-a running daemon. Both ends use the configured relays plus
-`wss://relay.contextvm.org` and `wss://relay2.contextvm.org`.
+a running daemon. It discovers the daemon's signed NIP-65 list through the
+configured identity/service indexers, sends to its inboxes, and reads replies
+from its outboxes. `HIVE_CI_WATCHER_RELAYS` is an explicit CLI override for both
+directions. Failed discovery never turns an indexer into an operational relay.
 
 ```sh
 nak-account status five                 # use your own local account alias
@@ -130,9 +161,9 @@ and per-community readiness. `revoke` removes only the explicit grant.
 1. Start the daemon and note its pubkey. Decide now whether it should be
    persistent (`HIVE_CI_WATCHER_KEY_FILE` or `HIVE_CI_WATCHER_NSEC`) — steps 2
    and 5 bind to it.
-2. Add that pubkey to each loom worker's `ALLOW_UNPAID_PUBKEYS`.
+2. Add that pubkey to each Loom worker's configured Nostr freelist.
 3. `runners-add` each worker you want to use — only workers that now have the
-   watcher pubkey on their `ALLOW_UNPAID_PUBKEYS`. The pool is private and is
+   watcher pubkey on their freelist. The pool is private and is
    never published; an empty pool means no runs.
 4. `follow` the repos you want watched.
 5. Optionally publish a kind 30620 trusted-watchers list naming the daemon, so
@@ -146,17 +177,18 @@ A runner is eligible when it is **allowed ∩ online**. "Allowed" is the private
 
 Advertised pricing does **not** gate selection. A kind 10100 is one public
 replaceable event serving every reader, so a worker that runs unpaid jobs for
-the pubkeys in its `ALLOW_UNPAID_PUBKEYS` still advertises its ordinary rate to
+the pubkeys in its freelist still advertises its ordinary rate to
 everyone else — `loom-free-tier-worker`, for instance, advertises 0.1 sat/sec.
 Gating on "advertises no price" would exclude exactly the workers you have an
 arrangement with.
 
-So `runners-add <pubkey>` means: *the watcher pubkey is on that worker's
-`ALLOW_UNPAID_PUBKEYS`*. The watcher cannot verify this — a freelist is out of
-band and unreadable from Nostr — so getting it wrong shows up as jobs silently
-dropped at the worker, not as an error here. `hive-ci-watcher runners` reports
-each member's `advertises_pricing` and `pricing` so you can see what a worker
-charges the public, but neither field affects eligibility.
+So `runners-add <pubkey>` asserts an unpaid arrangement with that worker.
+`hive-ci-watcher runners` reports NIP-65 routes, advertisement freshness, pricing,
+and membership in a freelist when the worker advertises its list reference.
+Missing mailboxes prevent dispatch. Relay acceptance is recorded as `published`,
+not execution; signed worker `30100` and `5101` events provide execution evidence.
+A publication without worker confirmation is shown as `unconfirmed` after two
+minutes. Uncertain job publication is not automatically resubmitted.
 
 Every 5100 the watcher publishes omits the `payment` tag entirely.
 

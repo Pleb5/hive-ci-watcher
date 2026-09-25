@@ -137,15 +137,45 @@
           };
 
           relays = lib.mkOption {
+            type = lib.types.nullOr (lib.types.listOf lib.types.str);
+            default = null;
+            description = "Explicit service inbox/outbox shorthand. Null derives from optional communities.";
+          };
+
+          inboxRelays = lib.mkOption {
+            type = lib.types.nullOr (lib.types.listOf lib.types.str);
+            default = null;
+            description = "Explicit operational inbox override; null permits shorthand/community derivation.";
+          };
+
+          outboxRelays = lib.mkOption {
+            type = lib.types.nullOr (lib.types.listOf lib.types.str);
+            default = null;
+            description = "Explicit operational outbox override; null permits shorthand/community derivation.";
+          };
+
+          identityDiscoveryRelays = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = ["wss://relay.budabit.club" "wss://nos.lol" "wss://relay.damus.io"];
-            description = "Default relay set, unioned with each followed repo's announced relays.";
+            default = ["wss://purplepag.es"];
+            description = "Identity / NIP-65 discovery. Empty disables this path.";
+          };
+
+          gitDiscoveryRelays = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = ["wss://index.ngit.dev"];
+            description = "Repository announcement discovery only.";
+          };
+
+          serviceDiscoveryRelays = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = ["wss://relay.contextvm.org" "wss://relay2.contextvm.org"];
+            description = "ContextVM service discovery only.";
           };
 
           blossomServers = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = ["https://blossom.budabit.club" "https://blossom.primal.net" "https://cdn.sovbit.host"];
-            description = "Ordered Blossom servers; the first that answers wins.";
+            type = lib.types.nullOr (lib.types.listOf lib.types.str);
+            default = null;
+            description = "Explicit ordered Blossom override; null derives from communities.";
           };
 
           databasePath = lib.mkOption {
@@ -192,8 +222,13 @@
               HIVE_CI_WATCHER_KEY_FILE = lib.mkIf (cfg.persistKey && cfg.nsecFile == null) "/var/lib/hive-ci-watcher/watcher.key";
               HIVE_CI_WATCHER_DB = cfg.databasePath;
               HIVE_CI_WATCHER_COMMUNITIES_FILE = lib.mkIf (cfg.communitiesFile != null) cfg.communitiesFile;
-              HIVE_CI_WATCHER_RELAYS = lib.concatStringsSep "," cfg.relays;
-              HIVE_CI_WATCHER_BLOSSOM_SERVERS = lib.concatStringsSep "," cfg.blossomServers;
+              HIVE_CI_WATCHER_RELAYS = lib.mkIf (cfg.relays != null) (lib.concatStringsSep "," cfg.relays);
+              HIVE_CI_WATCHER_INBOX_RELAYS = lib.mkIf (cfg.inboxRelays != null) (lib.concatStringsSep "," cfg.inboxRelays);
+              HIVE_CI_WATCHER_OUTBOX_RELAYS = lib.mkIf (cfg.outboxRelays != null) (lib.concatStringsSep "," cfg.outboxRelays);
+              HIVE_CI_WATCHER_BLOSSOM_SERVERS = lib.mkIf (cfg.blossomServers != null) (lib.concatStringsSep "," cfg.blossomServers);
+              HIVE_CI_WATCHER_IDENTITY_DISCOVERY_RELAYS = lib.concatStringsSep "," cfg.identityDiscoveryRelays;
+              HIVE_CI_WATCHER_GIT_DISCOVERY_RELAYS = lib.concatStringsSep "," cfg.gitDiscoveryRelays;
+              HIVE_CI_WATCHER_SERVICE_DISCOVERY_RELAYS = lib.concatStringsSep "," cfg.serviceDiscoveryRelays;
               HIVE_CI_WATCHER_LOG_LEVEL = cfg.logLevel;
               LOG_LEVEL = cfg.sdkLogLevel;
             };

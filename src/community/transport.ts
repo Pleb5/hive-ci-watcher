@@ -28,11 +28,27 @@ interface QueryOwner {
 export class RelayAuthorityTransport implements AuthorityTransport {
   private active = 0
   private readonly owners = new Map<AbortSignal, QueryOwner>()
+  /** Failures are local to a dependency pass; a later refresh retries replicas. */
+  private readonly failedRelays = new WeakMap<AbortSignal, Set<string>>()
   constructor(private readonly pool: RelayPool) {}
 
   async query(relays: string[], filter: Filter, signal: AbortSignal): Promise<NostrEvent[]> {
-    const results = await Promise.allSettled([...new Set(relays)].map(url =>
-      this.schedule(signal, () => this.queryRelay(url, filter, signal)),
+    let failed = this.failedRelays.get(signal)
+    if (!failed) this.failedRelays.set(signal, failed = new Set())
+    const candidates = [...new Set(relays)].filter(url => !failed.has(url))
+    // One owner probes replicas serially. Divide its discovery allowance so
+    // even the last replica can answer before the pass's 60-second deadline.
+    // Definition discovery and newly advertised hints each get at most 20s of
+    // first-page waits. Further filters skip failed replicas for this pass.
+    const pageTimeoutMs = Math.max(1, Math.min(15000, Math.floor(20000 / candidates.length)))
+    const results = await Promise.allSettled(candidates.map(url =>
+      this.schedule(signal, async () => {
+        try { return await this.queryRelay(url, filter, signal, pageTimeoutMs) }
+        catch (error) {
+          if (!signal.aborted) failed.add(url)
+          throw error
+        }
+      }),
     ))
     if (signal.aborted) throw new Error('authority synchronization aborted')
     const successes = results.filter((r): r is PromiseFulfilledResult<NostrEvent[]> => r.status === 'fulfilled')
@@ -88,7 +104,7 @@ export class RelayAuthorityTransport implements AuthorityTransport {
     }
   }
 
-  private async queryRelay(url: string, filter: Filter, signal: AbortSignal): Promise<NostrEvent[]> {
+  private async queryRelay(url: string, filter: Filter, signal: AbortSignal, pageTimeoutMs: number): Promise<NostrEvent[]> {
     const events = new Map<string, NostrEvent>()
     let until: number | undefined
     for (let page = 0; page < 100; page++) {
@@ -115,7 +131,7 @@ export class RelayAuthorityTransport implements AuthorityTransport {
           takeWhile(message => message.type !== 'EOSE', true),
           takeUntil(cancelled),
           toArray(),
-          timeout(15000),
+          timeout(pageTimeoutMs),
         ))
       } finally {
         signal.removeEventListener('abort', abort)

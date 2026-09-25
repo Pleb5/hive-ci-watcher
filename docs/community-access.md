@@ -104,8 +104,14 @@ that a relay stores every event ever published elsewhere.
 
 History requests paginate with overlapping timestamps. An unpageable saturated
 timestamp or an exceeded page/history bound fails the refresh. Individual
-pages have a 15-second deadline, the synchronization pass has a 60-second
-deadline, and query concurrency is capped at four. Each synchronization owner
+pages have a deadline of at most 15 seconds, divided further across replicas
+to bound first-page discovery waits to 20 seconds per queried relay set. A relay
+that fails a query is skipped for the remaining dependencies in that pass;
+the next refresh retries it. This leaves time to query all dependencies through
+working replicas, including after definitions introduce new relay hints. Every
+filter still requires successful EOSE, and only fully completed, verified relay
+responses contribute events. The synchronization pass has a 60-second deadline,
+and query concurrency is capped at four. Each synchronization owner
 (community or repository hydration pass) gets at most one active relay attempt;
 waiting owners rotate after attempts, and queued requests cancel immediately.
 One owner's relay fan-out cannot occupy all four slots ahead of another owner.

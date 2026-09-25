@@ -1,10 +1,11 @@
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {EMPTY, NEVER, Observable, of, throwError} from 'rxjs'
+import {matchFilter, type Filter} from 'nostr-tools'
 import {RelayAuthorityTransport} from '../src/community/transport.js'
 import {CommunityAccess} from '../src/community/service.js'
 import {parseCommunityConfig} from '../src/community/config.js'
 import {WatcherDb} from '../src/db/index.js'
-import {ADDRESS, COMMUNITY, OTHER, definition} from './community-helpers.js'
+import {ADDRESS, COMMUNITY, LIST, MEMBER, OTHER, ban, definition, event, list, retract} from './community-helpers.js'
 
 afterEach(() => vi.useRealTimers())
 const eose = {type: 'EOSE'}
@@ -14,6 +15,66 @@ function setup(req: (url: string, filter: any) => Observable<any>) {
 }
 
 describe('authority transport completeness', () => {
+  it.each([
+    {healthyLast: false, hangingCount: 1, hintCount: 0},
+    {healthyLast: true, hangingCount: 1, hintCount: 0},
+    {healthyLast: false, hangingCount: 19, hintCount: 19},
+    {healthyLast: true, hangingCount: 19, hintCount: 19},
+  ])('uses a healthy replica despite hanging relays (healthyLast=$healthyLast, configured=$hangingCount, hints=$hintCount)', async ({healthyLast, hangingCount, hintCount}) => {
+    vi.useFakeTimers()
+    const db = new WatcherDb(':memory:')
+    const healthy = 'wss://healthy.example.com'
+    const hanging = Array.from({length: hangingCount}, (_, i) => `wss://offline-${i}.example.com`)
+    const hints = Array.from({length: hintCount}, (_, i) => `wss://hint-${i}.example.com`)
+    const originalBan = ban(), nextBan = ban(MEMBER, 1010)
+    const announcement = event(32222, [
+      ['d', COMMUNITY], ['name', 'Community'], ...[...hints, healthy].map(url => ['r', url]),
+      ['content', 'General'], ['k', '1111'], ['a', LIST],
+    ])
+    const base = [announcement, list()]
+    let events = [...base, originalBan, retract(originalBan)]
+    let serving = healthy
+    const kinds: number[] = []
+    const transport = new RelayAuthorityTransport({relay: (url: string) => ({
+      req: (filter: Filter) => {
+        if (url !== serving) return NEVER
+        kinds.push(...filter.kinds!)
+        return of(...events.filter(e => matchFilter(filter, e)).map(event => ({type: 'EVENT', event})), eose)
+      },
+      subscription: () => NEVER,
+    })} as any)
+    const service = new CommunityAccess(parseCommunityConfig({communities: [{
+      address: ADDRESS, relays: healthyLast ? [...hanging, healthy] : [healthy, ...hanging],
+    }]}), transport, db)
+    const refresh = async () => {
+      kinds.length = 0
+      const started = Math.floor(Date.now() / 1000)
+      const pending = service.refresh()
+      await vi.advanceTimersByTimeAsync(60001)
+      await pending
+      expect(service.status()[0]).toMatchObject({state: 'ready', last_synced_at: started})
+      expect(kinds).toEqual(expect.arrayContaining([32222, 30000, 1984, 5]))
+    }
+    try {
+      await refresh()
+      expect(service.sources(MEMBER)).toEqual([ADDRESS])
+      events = [...base, nextBan]
+      await refresh()
+      expect(service.sources(MEMBER)).toEqual([])
+      events = base // The ban and prior tombstone remain even when a replica omits them.
+      await refresh()
+      expect(service.sources(MEMBER)).toEqual([])
+      events = [...base, originalBan, retract(nextBan)]
+      await refresh()
+      expect(service.sources(MEMBER)).toEqual([ADDRESS])
+      serving = hanging[0]! // A previously failed replica recovers for the next pass.
+      await refresh()
+      expect(service.sources(MEMBER)).toEqual([ADDRESS])
+    } finally {
+      await service.stop()
+      db.close()
+    }
+  })
   it('rotates waiting owners and cancels a queued owner without waiting for relay I/O', async () => {
     vi.useFakeTimers()
     const requests: string[] = []

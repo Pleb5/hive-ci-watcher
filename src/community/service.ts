@@ -123,10 +123,10 @@ export class CommunityAccess {
   }
 
   private async synchronize(branch: Branch): Promise<void> {
-    const started = this.now()
     const controller = new AbortController()
     branch.controller = controller
-    const deadline = setTimeout(() => controller.abort(), 60000)
+    let deadline: NodeJS.Timeout | undefined
+    let release: (() => void) | undefined
     const pointer = communityPointer(branch.source.address)!
     const definitionFilter: Filter = {kinds: [32222], authors: [pointer.owner], '#d': [pointer.id]}
     const apply = (events: NostrEvent[]) => {
@@ -143,6 +143,9 @@ export class CommunityAccess {
       if (changed && !this.stopped) this.publish(branch)
     }
     try {
+      release = await this.transport.admit(controller.signal)
+      const started = this.now()
+      deadline = setTimeout(() => controller.abort(), 60000)
       apply(await this.transport.query(branch.source.relays, definitionFilter, controller.signal))
       const definitionId = branch.view.definition?.event.id
       const refs = branch.view.refs()
@@ -172,6 +175,9 @@ export class CommunityAccess {
         log.warn('community synchronization incomplete', {address: branch.source.address, error: branch.error})
         this.checkFreshness()
       }
-    } finally { clearTimeout(deadline) }
+    } finally {
+      clearTimeout(deadline)
+      release?.()
+    }
   }
 }

@@ -5,7 +5,7 @@ import {RelayAuthorityTransport} from '../src/community/transport.js'
 import {CommunityAccess} from '../src/community/service.js'
 import {parseCommunityConfig} from '../src/community/config.js'
 import {WatcherDb} from '../src/db/index.js'
-import {ADDRESS, COMMUNITY, LIST, MEMBER, OTHER, ban, definition, event, list, retract} from './community-helpers.js'
+import {ADDRESS, COMMUNITY, LIST, MEMBER, OTHER, OWNER, ban, definition, event, list, retract} from './community-helpers.js'
 
 afterEach(() => vi.useRealTimers())
 const eose = {type: 'EOSE'}
@@ -15,6 +15,74 @@ function setup(req: (url: string, filter: any) => Observable<any>) {
 }
 
 describe('authority transport completeness', () => {
+  it('admits a healthy last community after capacity-bound queueing and renews it with repository contention', async () => {
+    vi.useFakeTimers()
+    const db = new WatcherDb(':memory:')
+    let healthyQueries = 0, active = 0, peak = 0
+    const transport = new RelayAuthorityTransport({relay: (url: string) => ({
+      req: () => new Observable(subscriber => {
+        active++
+        peak = Math.max(peak, active)
+        if (url === 'wss://healthy.example.com') {
+          healthyQueries++
+          subscriber.next(eose)
+          subscriber.complete()
+        }
+        return () => { active-- }
+      }),
+      subscription: () => NEVER,
+    })} as any)
+    const service = new CommunityAccess(parseCommunityConfig({
+      refreshSeconds: 5, maxAgeSeconds: 30,
+      communities: [
+        ...Array.from({length: 16}, (_, i) => ({address: `32222:${OWNER}:${i.toString(16).padStart(64, '0')}`, relays: [`wss://offline-${i}.example.com`]})),
+        {address: ADDRESS, relays: ['wss://healthy.example.com']},
+      ],
+    }), transport, db)
+    const repos = Array.from({length: 8}, () => new AbortController())
+    let hydration: Array<Promise<unknown>> = []
+    try {
+      const first = service.refresh()
+      hydration = repos.map((controller, i) => transport.query([`wss://repo-${i}.example.com`], {kinds: [30618]}, controller.signal).catch(() => []))
+      await vi.advanceTimersByTimeAsync(60001)
+      await first
+      expect(service.sources(OWNER)).toEqual([ADDRESS])
+      const previous = service.status().find(status => status.address === ADDRESS)!.last_synced_at!
+      const queries = healthyQueries
+      const second = service.refresh()
+      await vi.advanceTimersByTimeAsync(30001)
+      expect(service.sources(OWNER)).toEqual([]) // Queueing does not extend old authorization.
+      await vi.advanceTimersByTimeAsync(60001)
+      await second
+      expect(service.sources(OWNER)).toEqual([ADDRESS])
+      expect(service.status().find(status => status.address === ADDRESS)!.last_synced_at).toBeGreaterThan(previous)
+      expect(healthyQueries).toBeGreaterThan(queries)
+      expect(peak).toBeLessThanOrEqual(4)
+    } finally {
+      for (const repo of repos) repo.abort()
+      await service.stop()
+      await Promise.all(hydration)
+      db.close()
+    }
+  })
+  it('cancels queued community passes at shutdown without starting their requests', async () => {
+    vi.useFakeTimers()
+    const db = new WatcherDb(':memory:')
+    let requests = 0
+    const transport = new RelayAuthorityTransport({relay: () => ({
+      req: () => { requests++; return NEVER }, subscription: () => NEVER,
+    })} as any)
+    const service = new CommunityAccess(parseCommunityConfig({communities:
+      Array.from({length: 17}, (_, i) => ({address: `32222:${OWNER}:${i.toString(16).padStart(64, '0')}`, relays: [`wss://offline-${i}.example.com`]})),
+    }), transport, db)
+    const refresh = service.refresh()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(requests).toBe(4)
+    await service.stop()
+    await refresh
+    expect(requests).toBe(4)
+    db.close()
+  })
   it.each([
     {healthyLast: false, hangingCount: 1, hintCount: 0},
     {healthyLast: true, hangingCount: 1, hintCount: 0},
@@ -91,7 +159,7 @@ describe('authority transport completeness', () => {
     await expect(queued).rejects.toThrow('aborted')
     expect(requests).not.toContain('wss://cancelled')
     const healthy = query(['wss://healthy'])
-    await vi.advanceTimersByTimeAsync(15001)
+    await vi.advanceTimersByTimeAsync(20001)
     await expect(healthy).resolves.toEqual([])
     for (const controller of controllers) controller.abort()
     await Promise.all(pending)
@@ -156,7 +224,13 @@ describe('authority transport completeness', () => {
   it('cancels a hanging request on shutdown', async () => {
     const controller = new AbortController()
     let unsubscribed = false
-    const pending = setup(() => new Observable(() => () => { unsubscribed = true }))(['wss://one'], controller.signal)
+    let started!: () => void
+    const receiving = new Promise<void>(resolve => { started = resolve })
+    const pending = setup(() => new Observable(() => {
+      started()
+      return () => { unsubscribed = true }
+    }))(['wss://one'], controller.signal)
+    await receiving
     controller.abort()
     await expect(pending).rejects.toThrow('aborted')
     expect(unsubscribed).toBe(true)

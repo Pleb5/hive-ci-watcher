@@ -3,6 +3,8 @@ import {matchFilter, verifyEvent, type Filter, type NostrEvent} from 'nostr-tool
 import {lastValueFrom, Subject, takeUntil, takeWhile, tap, toArray, timeout} from 'rxjs'
 
 export interface AuthorityTransport {
+  /** Reserve a fair pass slot; release in finally. Start the pass deadline only after admission. */
+  admit(signal: AbortSignal): Promise<() => void>
   query(relays: string[], filter: Filter, signal: AbortSignal): Promise<NostrEvent[]>
   subscribe(relays: string[], filters: Filter[], receive: (event: NostrEvent) => void): () => void
 }
@@ -24,15 +26,87 @@ interface QueryOwner {
   abort: () => void
 }
 
+interface Admission {
+  signal: AbortSignal
+  users: number
+  active: boolean
+  ready: Promise<void>
+  resolve: () => void
+  abort: () => void
+}
+
 /** Raw verified intake, deliberately independent of EventStore's deletion manager. */
 export class RelayAuthorityTransport implements AuthorityTransport {
   private active = 0
   private readonly owners = new Map<AbortSignal, QueryOwner>()
   /** Failures are local to a dependency pass; a later refresh retries replicas. */
   private readonly failedRelays = new WeakMap<AbortSignal, Set<string>>()
+  private admitted = 0
+  private readonly admissions = new Map<AbortSignal, Admission>()
   constructor(private readonly pool: RelayPool) {}
 
+  /** FIFO admission persists while a pass is queued. Four admitted owners each
+   * retain one I/O slot across their dependency queries; later owners cannot
+   * spend their deadline waiting, nor interrupt an admitted pass between filters.
+   * Nested query leases share the pass's slot and release it by reference count. */
+  async admit(signal: AbortSignal): Promise<() => void> {
+    if (signal.aborted) throw new Error('authority synchronization aborted')
+    let admission = this.admissions.get(signal)
+    if (!admission) {
+      let resolve!: () => void
+      let reject!: (error: Error) => void
+      const ready = new Promise<void>((yes, no) => { resolve = yes; reject = no })
+      const entry: Admission = {signal, users: 0, active: false, ready, resolve, abort: () => {
+        if (entry.active) return // Active requests observe this same signal.
+        reject(new Error('authority synchronization aborted'))
+        this.admissions.delete(signal)
+        signal.removeEventListener('abort', entry.abort)
+        this.admitWaiting()
+      }}
+      admission = entry
+      this.admissions.set(signal, admission)
+      signal.addEventListener('abort', admission.abort, {once: true})
+    }
+    const entry = admission
+    entry.users++
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      if (--entry.users || this.admissions.get(signal) !== entry) return
+      this.admissions.delete(signal)
+      signal.removeEventListener('abort', entry.abort)
+      if (entry.active) this.admitted--
+      this.admitWaiting()
+    }
+    this.admitWaiting()
+    try {
+      await entry.ready
+      if (signal.aborted) throw new Error('authority synchronization aborted')
+      return release
+    } catch (error) {
+      release()
+      throw error
+    }
+  }
+
+  private admitWaiting(): void {
+    for (const entry of this.admissions.values()) {
+      if (this.admitted >= 4) return
+      if (entry.active || entry.signal.aborted) continue
+      entry.active = true
+      this.admitted++
+      entry.resolve()
+    }
+  }
+
   async query(relays: string[], filter: Filter, signal: AbortSignal): Promise<NostrEvent[]> {
+    const release = await this.admit(signal)
+    try { return await this.queryAdmitted(relays, filter, signal) }
+    finally { release() }
+  }
+
+  private async queryAdmitted(relays: string[], filter: Filter, signal: AbortSignal): Promise<NostrEvent[]> {
     let failed = this.failedRelays.get(signal)
     if (!failed) this.failedRelays.set(signal, failed = new Set())
     const candidates = [...new Set(relays)].filter(url => !failed.has(url))

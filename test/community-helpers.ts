@@ -31,6 +31,10 @@ export class MemoryTransport implements AuthorityTransport {
   failedRelays = new Set<string>()
   queries: Filter[] = []
   private listeners: Array<{filters: Filter[]; receive: (event: NostrEvent) => void}> = []
+  async admit(signal: AbortSignal) {
+    if (signal.aborted) throw new Error('offline')
+    return () => {}
+  }
   async query(relays: string[], filter: Filter, signal: AbortSignal) {
     this.queries.push(filter)
     if (signal.aborted || this.fail || relays.every(url => this.failedRelays.has(url))) throw new Error('offline')

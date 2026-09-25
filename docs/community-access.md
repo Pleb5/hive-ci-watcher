@@ -110,16 +110,21 @@ that fails a query is skipped for the remaining dependencies in that pass;
 the next refresh retries it. This leaves time to query all dependencies through
 working replicas, including after definitions introduce new relay hints. Every
 filter still requires successful EOSE, and only fully completed, verified relay
-responses contribute events. The synchronization pass has a 60-second deadline,
-and query concurrency is capped at four. Each synchronization owner
-(community or repository hydration pass) gets at most one active relay attempt;
-waiting owners rotate after attempts, and queued requests cancel immediately.
-One owner's relay fan-out cannot occupy all four slots ahead of another owner.
+responses contribute events.
+
+Community and repository-hydration passes share a FIFO admission queue with four
+slots. An admitted pass retains its slot across all dependency queries and gets
+at most one active relay attempt; global query concurrency remains at most four.
+The 60-second pass deadline starts **after admission**, so a later owner does not
+exhaust its deadline in the queue and repeat that failure on every refresh.
+Completing or aborting a pass releases its slot to the oldest waiting owner.
+Queued passes and requests cancel promptly at shutdown or suspension. Queueing
+does not renew old authority or confer access; stale membership remains denied.
 
 Live changes apply immediately; only completed synchronization renews freshness.
 A changed definition invalidates completeness until its dependencies are
 loaded. A failed refresh preserves already-completed authority only until its
-maximum age, measured from the start of that synchronization. Expiry is checked
+maximum age, measured from the admitted start of that synchronization. Expiry is checked
 on access as well as by a timer. Communities fail independently. No ready
 membership source means no community-derived access, including for its owner.
 Manual/operator grants remain separate sources.

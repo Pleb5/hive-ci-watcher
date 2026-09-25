@@ -412,9 +412,12 @@ export class Watcher {
   private async loadRepoBaseline(watch: RepoWatch): Promise<void> {
     const controller = new AbortController()
     watch.baselineController = controller
-    const deadline = setTimeout(() => controller.abort(), 60000)
+    let deadline: NodeJS.Timeout | undefined
+    let release: (() => void) | undefined
     const current = () => this.running && !controller.signal.aborted && this.repos.get(watch.repoAddr) === watch && this.isEligible(watch.repoAddr)
     try {
+      release = await this.authorityTransport.admit(controller.signal)
+      deadline = setTimeout(() => controller.abort(), 60000)
       const outboxes = await firstOutboxes(this.nostr, watch.owner)
       if (!current()) return
       const relays = normalizeRelays(mergeRelaySets(this.nostr.defaults, watch.hints.value, outboxes))
@@ -445,7 +448,10 @@ export class Watcher {
       this.enqueue(watch.repoAddr, signal => this.evaluateRepo(watch.repoAddr, signal))
     } catch (error) {
       if (current()) log.warn('repo baseline incomplete; will retry', {repoAddr: watch.repoAddr, error: errorMessage(error)})
-    } finally { clearTimeout(deadline) }
+    } finally {
+      clearTimeout(deadline)
+      release?.()
+    }
   }
 
   /**

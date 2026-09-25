@@ -75,7 +75,8 @@ a running daemon. Both ends use the configured relays plus
 `wss://relay.contextvm.org` and `wss://relay2.contextvm.org`.
 
 ```sh
-export HIVE_CI_WATCHER_CLI_NSEC=nsec1...   # operator, explicitly allowed requester, or community member
+nak-account status five                 # use your own local account alias
+export HIVE_CI_WATCHER_CLI_ACCOUNT=five   # operator, explicitly allowed requester, or community member
 export HIVE_CI_WATCHER_PUBKEY=<daemon pubkey>
 
 hive-ci-watcher status
@@ -88,6 +89,24 @@ hive-ci-watcher list                                # includes the announcement 
 hive-ci-watcher unfollow 30617:<owner>:<id>            # remove your registration
 hive-ci-watcher unfollow 30617:<owner>:<id> --all      # operator: remove every registration
 ```
+
+With `HIVE_CI_WATCHER_CLI_ACCOUNT`, run the CLI on the machine with your
+`nak-account` installation and an authorized signer. If needed, run
+`nak-account start five` in a terminal first. The CLI delegates event signing
+and NIP-44 encryption/decryption to `nak-account run --as five -- …`; it does
+not read the operator key, bunker profiles, or the account client's key file.
+The SDK handles ContextVM requests, encrypted gift wraps, and responses.
+`nak` alone does not provide this management protocol. Tested with nak 0.19.7.
+
+Only the operator **public** key belongs in the daemon configuration. The
+daemon has its own persistent key, which is the identity authorized on Loom
+workers. The local signer must be trusted: an authorized application can ask
+it to sign as your operator. Also, nak 0.19.7 accepts NIP-44 message inputs as
+process arguments, so local process inspection can expose management payloads.
+The operator secret is never supplied in those arguments.
+
+Alternatively, the CLI still accepts `HIVE_CI_WATCHER_CLI_NSEC`, loaded from
+private storage. Set exactly one signer option; configuring both is an error.
 
 If `list` shows `announcement_probe.found: false`, the repo's 30617 is on no
 relay the watcher can see. The watcher already consults the owner's NIP-65

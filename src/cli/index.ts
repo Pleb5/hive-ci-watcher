@@ -2,11 +2,11 @@
 import '../env-defaults.js'
 import {EncryptionMode, GiftWrapMode} from '@contextvm/sdk/core'
 import {ApplesauceRelayPool} from '@contextvm/sdk/relay'
-import {PrivateKeySigner} from '@contextvm/sdk/signer'
 import {NostrClientTransport} from '@contextvm/sdk/transport'
 import {Client} from '@contextvm/mcp-sdk/client/index.js'
-import {CVM_RELAYS, DEFAULT_RELAYS, normalizePubkey, normalizeRelays, normalizeSecretKey} from '../config.js'
+import {CVM_RELAYS, DEFAULT_RELAYS, normalizePubkey, normalizeRelays} from '../config.js'
 import {errorMessage} from '../log.js'
+import {loadCliSigner} from './signer.js'
 
 /**
  * Every subcommand is exactly one ContextVM tool call — the CLI holds no state
@@ -64,7 +64,8 @@ function usage(): string {
     ...Object.values(COMMANDS).map(command => `  ${command.usage}`),
     '',
     'Environment:',
-    '  HIVE_CI_WATCHER_CLI_NSEC     required — the caller identity (owner or an allowlisted requester)',
+    '  HIVE_CI_WATCHER_CLI_ACCOUNT  caller identity via an active local nak-account alias',
+    '  HIVE_CI_WATCHER_CLI_NSEC     alternative caller identity (set exactly one signer option)',
     '  HIVE_CI_WATCHER_PUBKEY       required — the watcher daemon pubkey to talk to',
     '  HIVE_CI_WATCHER_RELAYS       optional — comma-separated relays',
   ].join('\n')
@@ -80,10 +81,10 @@ async function main(): Promise<void> {
   const command = COMMANDS[name]
   if (!command) throw new Error(`unknown command '${name}'\n\n${usage()}`)
 
-  const nsec = process.env.HIVE_CI_WATCHER_CLI_NSEC
-  if (!nsec) throw new Error('HIVE_CI_WATCHER_CLI_NSEC is required')
+  const signer = loadCliSigner()
   const serverPubkey = process.env.HIVE_CI_WATCHER_PUBKEY
   if (!serverPubkey) throw new Error('HIVE_CI_WATCHER_PUBKEY is required')
+  await signer.getPublicKey()
 
   const relays = normalizeRelays([
     ...(process.env.HIVE_CI_WATCHER_RELAYS || DEFAULT_RELAYS.join(',')).split(','),
@@ -92,7 +93,7 @@ async function main(): Promise<void> {
 
   const relayPool = new ApplesauceRelayPool(relays)
   const transport = new NostrClientTransport({
-    signer: new PrivateKeySigner(normalizeSecretKey(nsec)),
+    signer,
     relayHandler: relayPool,
     serverPubkey: normalizePubkey(serverPubkey, 'HIVE_CI_WATCHER_PUBKEY'),
     encryptionMode: EncryptionMode.REQUIRED,

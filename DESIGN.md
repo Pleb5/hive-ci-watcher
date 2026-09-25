@@ -15,7 +15,7 @@ State in SQLite (`better-sqlite3`). Remote control via ContextVM (MCP over Nostr
 |---|---|---|
 | **Watcher** | **Default: a fresh key generated at every boot**, logged as hex + npub on startup, its 11316 retracted (NIP-09 by address) on shutdown. `HIVE_CI_WATCHER_KEY_FILE` generates once and reuses; `HIVE_CI_WATCHER_NSEC` (hex or nsec) supplies one and wins. | Signs 5401 / 5100 / Blossom 24242 auth / CVM responses. Must be present in each loom worker's `ALLOW_UNPAID_PUBKEYS` — added out of band, nothing here automates it. Persist the key once it is on freelists or in 30620 lists; both bind to the pubkey. |
 | **Watcher owner** | never held by the daemon | Human. Pubkey in `HIVE_CI_WATCHER_OWNER_PUBKEY`. Publishes the runner list (kind 30621). Implicitly authorized for every CVM tool; needs no allowlist entry. |
-| **Requester** | — | Any pubkey in the watcher's allowlist. May follow/unfollow **any** repo. |
+| **Requester** | — | Explicitly allowed pubkey or effective member of any ready configured community. May register any repo and remove their own registration. |
 | **Repo owner** | — | Author of the repo's kind 30617. Their announcement is the trust root: it defines the maintainer set. |
 | **Repo maintainer** | — | The repo owner plus every pubkey in the owner's 30617 `maintainers` tag. Any of them may publish the kind 30618 the watcher triggers on. |
 
@@ -342,16 +342,16 @@ Authorization is by the caller's pubkey, taken from the decrypted inner event
 
 | Tool | Who | Effect |
 |---|---|---|
-| `follow_repo` | owner, allowlisted | Add a repo to the follow table. Any repo — no maintainer check. Accepts a `30617:…` address or an **naddr**, whose relay hints are stored and subscribed; extra `relays` may be passed. |
-| `unfollow_repo` | owner, allowlisted | Remove it. |
-| `list_followed` | owner, allowlisted | Followed repos + per-ref last-seen commit, relay hints, the follow-time announcement probe result, and any workflow files that failed to parse at the last evaluated commit (with the YAML error). |
-| `status` | owner, allowlisted | Uptime, per-relay state (connected, liveness, failures, last event, event count), runner pool, recent runs. |
-| `list_runners` | owner, allowlisted | Resolved pool: allowed ∩ online, with the round-robin cursor, each member's advertised pricing (reported, not gated) and `on_freelist` — verified against the worker's published 30000 set when it advertises one. |
+| `follow_repo` | owner, eligible requester | Register any repo for the caller — no maintainer check. Accepts a `30617:…` address or an **naddr**, whose relay hints are stored and subscribed; extra `relays` may be passed. |
+| `unfollow_repo` | owner, eligible or registered requester | Remove the caller's registration. Owner can target a requester or remove all registrations. |
+| `list_followed` | owner, eligible or registered requester | Caller's registrations, eligibility/provenance, activation, per-ref state, schedules, announcement probe and workflow errors. Owner sees all registrations. |
+| `status` | owner, eligible or registered requester | Uptime, relay health, runner pool, scoped repo count and recent runs, caller's access sources. Owner also sees community readiness. |
+| `list_runners` | owner, eligible requester | Resolved pool: allowed ∩ online, with round-robin cursor, advertised pricing (reported, not gated), and published `on_freelist` status. |
 | `runners_add` | owner only | Add a runner pubkey to the pool. |
 | `runners_remove` | owner only | Remove one. |
 | `allow_pubkey` | owner only | Add a requester to the allowlist. |
-| `revoke_pubkey` | owner only | Remove one. |
-| `list_allowed` | owner only | Dump the allowlist. |
+| `revoke_pubkey` | owner only | Remove an explicit grant; community-derived access remains independent. |
+| `list_allowed` | owner only | Explicit grants, derived members with community sources, and per-community readiness. |
 
 Unknown callers get a flat "not authorized" — the daemon does not disclose
 whether a pubkey exists in the allowlist.
@@ -363,9 +363,19 @@ with the same bytes is otherwise indistinguishable from the original; the
 caller's own timestamp turns a captured `allow_pubkey` into a dead letter
 instead of a re-grant.
 
-`unfollow_repo` is open to every allowlisted requester, not just the one who
-followed — the allowlist is a high-trust set, and `added_by` is recorded for
-blame rather than enforced.
+Registrations are keyed by `(repo_addr, requester)`. Several requesters share
+one repository pipeline. Removing or suspending one registration leaves the
+pipeline active while another eligible registration remains. Losing the last
+eligible registration aborts evaluation and prevents new submissions. Restart
+and resume require a completed relay synchronization and seed current refs
+without replaying suspended work or old schedules. An activation epoch also
+invalidates work prepared before a suspension, even if access returns before
+the asynchronous work finishes. Submitted worker jobs are not canceled.
+
+Community eligibility is the union of effective memberships across independently
+fresh exact community coordinates; a ban in one community does not override
+another source. Protected authority deletions are intentionally ignored. See
+[community-access.md](docs/community-access.md) for derivation and freshness rules.
 
 The CLI (`hive-ci-watcher`) is a thin ContextVM client over these tools — every
 subcommand is one tool call.
@@ -377,7 +387,9 @@ subcommand is one tool call.
 ```sql
 followed_repos(repo_addr PK, repo_owner, d_tag, default_branch, added_by, added_at,
                seeded_at,   -- NULL until the first 30618 has been recorded
-               relay_hints) -- JSON array from the follower's naddr / relays arg
+               relay_hints, active) -- aggregate hints; attribution retained for migration
+repo_registrations(repo_addr FK, requester, added_at, relay_hints,
+                   PK(repo_addr,requester))
 ref_state     (repo_addr, ref, commit_id, updated_at, deleted_at, PK(repo_addr,ref))
               -- ref is the full name: refs/heads/main, refs/tags/v1.2.0
               -- deleted_at set = tombstone; commit kept so a reappearance
@@ -388,7 +400,7 @@ runs          (run_id PK, repo_addr, ref, commit_id, workflow_path, runner_pubke
 allowlist     (pubkey PK, added_at)
 runner_pool   (pubkey PK, added_at)   -- private, never published
 kv            (key PK, value)   -- round-robin cursor, cached runner-script
-                                 -- blob URL, relay bookkeeping
+                                 -- blob URL, relay bookkeeping, authority projections and migration marker
 ```
 
 Env:
@@ -398,6 +410,7 @@ HIVE_CI_WATCHER_NSEC             optional; wins over the key file
 HIVE_CI_WATCHER_KEY_FILE         optional; generated once, reused. Unset: new key per boot
 HIVE_CI_WATCHER_OWNER_PUBKEY     required
 HIVE_CI_WATCHER_DB               default ./watcher.db
+HIVE_CI_WATCHER_COMMUNITIES_FILE optional; local JSON, read on start
 HIVE_CI_WATCHER_RELAYS           comma-separated defaults
 HIVE_CI_WATCHER_BLOSSOM_SERVERS  comma-separated, ordered
 HIVE_CI_WATCHER_FETCH_RETRY_WINDOW  seconds to keep polling a lagging remote, default 600
@@ -411,20 +424,19 @@ When given, plaintext nsec in env for v1; NIP-49 later.
 
 Trust is delegated in a chain and each hop is unbounded:
 
-- the **watcher owner** trusts every allowlisted requester as a near co-owner
-  — they may follow any repo, unfollow anyone's, and spend the freelist without
-  quota;
+- the **watcher owner** selects communities and explicit grants whose members
+  may register any repo and consume the runner pool without per-user quotas;
+- **community owners and moderators** control their community's memberships
+  and effective bans; they do not become watcher operators;
 - each **requester** trusts every owner of every repo they follow — that owner
   controls the clone URLs the watcher fetches from, the relays it connects to
   and publishes on, and (via workflows) the code that runs on the worker;
 - each **repo owner** trusts every maintainer they list, who can publish the
   30618 that decides what gets built.
 
-None of this is enforced by the watcher beyond signature checks and the
-validations in §3–§5. That is a deliberate v1 choice: the allowlist is small
-and hand-picked, so the trust is real. If the allowlist ever grows past
-"people who could be handed the owner key", per-requester quotas at the first
-hop are the place to bound the whole chain.
+The watcher enforces registration ownership, membership freshness, signature
+checks, and the validations in §3–§5. Runner-pool changes and explicit grants
+remain operator-only. Per-requester quotas are deferred.
 
 Repo owners cannot opt out of being CI'd by someone else's watcher. They do
 not have to pay attention to it either: a watcher they have not named in
@@ -457,6 +469,7 @@ hive-ci-watcher/
   .github/workflows/     test.yml — the watcher's own CI, run under act
   src/
     config.ts            env parsing, defaults
+    community/           headless membership, verified authority intake and freshness
     identity.ts          watcher signer, NIP-44
     db/                  schema + typed accessors
     nostr/               relay pool, 30617/30618, 10100 workers
@@ -481,7 +494,7 @@ hive-ci-watcher/
   `NoNewPrivileges`). The nsec never enters the Nix store — the module takes a
   `nsecFile` path and feeds it via `LoadCredential`/`EnvironmentFile`, sourced
   from sops-nix or agenix. Options mirror §7: `ownerPubkey`, `relays`,
-  `blossomServers`, `databasePath`.
+  `blossomServers`, `databasePath`, `communitiesFile`.
 - `devShells.default` — node, pnpm, git, sqlite, `act`, `nak`.
 
 `git` must be on the unit's `PATH`; §4 shells out to it. The git child never

@@ -12,6 +12,14 @@ export interface FollowedRepo {
   addedAt: number
   seededAt: number | null
   relayHints: string[]
+  active: boolean
+}
+
+export interface RepoRegistration {
+  repoAddr: string
+  requester: string
+  addedAt: number
+  relayHints: string[]
 }
 
 export interface RefState {
@@ -78,6 +86,15 @@ export class WatcherDb {
     ensureColumn('followed_repos', 'seeded_at', 'INTEGER')
     ensureColumn('followed_repos', 'relay_hints', "TEXT NOT NULL DEFAULT '[]'")
     ensureColumn('ref_state', 'deleted_at', 'INTEGER')
+    ensureColumn('followed_repos', 'active', 'INTEGER NOT NULL DEFAULT 0')
+    // A one-time backfill, never recreated from historical added_by after a
+    // requester removes their registration and another requester remains.
+    this.db.transaction(() => {
+      if (this.getKv('schema:registrations:v1')) return
+      this.db.exec(`INSERT OR IGNORE INTO repo_registrations (repo_addr, requester, added_at, relay_hints)
+        SELECT repo_addr, added_by, added_at, relay_hints FROM followed_repos`)
+      this.setKv('schema:registrations:v1', '1')
+    })()
   }
 
   close(): void {
@@ -93,16 +110,56 @@ export class WatcherDb {
     addedBy: string
     relayHints?: string[]
   }): void {
-    const hints = JSON.stringify(repo.relayHints ?? [])
-    // A re-follow with new hints keeps the row (and its seed) but widens the hints.
-    this.db
-      .prepare(
+    this.db.transaction(() => {
+      const existing = this.listRegistrations(repo.repoAddr).find(r => r.requester === repo.addedBy)
+      const hints = JSON.stringify([...new Set([...(existing?.relayHints ?? []), ...(repo.relayHints ?? [])])])
+      this.db.prepare(
         `INSERT INTO followed_repos (repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints)
          VALUES (?, ?, ?, NULL, ?, ?, NULL, ?)
-         ON CONFLICT(repo_addr) DO UPDATE SET relay_hints = excluded.relay_hints
-           WHERE excluded.relay_hints <> '[]'`,
+         ON CONFLICT(repo_addr) DO NOTHING`,
       )
       .run(repo.repoAddr, repo.repoOwner, repo.dTag, repo.addedBy, nowSeconds(), hints)
+      this.db.prepare(`INSERT INTO repo_registrations (repo_addr, requester, added_at, relay_hints)
+        VALUES (?, ?, ?, ?) ON CONFLICT(repo_addr, requester) DO UPDATE SET relay_hints = excluded.relay_hints`)
+        .run(repo.repoAddr, repo.addedBy, nowSeconds(), hints)
+      this.updateRegistrationHints(repo.repoAddr)
+    })()
+  }
+
+  listRegistrations(repoAddr?: string): RepoRegistration[] {
+    const rows = repoAddr
+      ? this.db.prepare('SELECT * FROM repo_registrations WHERE repo_addr = ? ORDER BY added_at, requester').all(repoAddr)
+      : this.db.prepare('SELECT * FROM repo_registrations ORDER BY added_at, requester').all()
+    return rows.map((row: any) => ({repoAddr: row.repo_addr, requester: row.requester, addedAt: row.added_at, relayHints: parseHints(row.relay_hints)}))
+  }
+
+  hasRegistration(pubkey: string, repoAddr?: string): boolean {
+    return (repoAddr
+      ? this.db.prepare('SELECT 1 FROM repo_registrations WHERE requester = ? AND repo_addr = ?').get(pubkey, repoAddr)
+      : this.db.prepare('SELECT 1 FROM repo_registrations WHERE requester = ?').get(pubkey)) !== undefined
+  }
+
+  removeRegistration(repoAddr: string, requester?: string): boolean {
+    return this.db.transaction(() => {
+      const result = requester
+        ? this.db.prepare('DELETE FROM repo_registrations WHERE repo_addr = ? AND requester = ?').run(repoAddr, requester)
+        : this.db.prepare('DELETE FROM repo_registrations WHERE repo_addr = ?').run(repoAddr)
+      this.updateRegistrationHints(repoAddr)
+      return result.changes > 0
+    })()
+  }
+
+  private updateRegistrationHints(repoAddr: string): void {
+    const hints = [...new Set(this.listRegistrations(repoAddr).flatMap(registration => registration.relayHints))]
+    this.db.prepare('UPDATE followed_repos SET relay_hints = ? WHERE repo_addr = ?').run(JSON.stringify(hints), repoAddr)
+  }
+
+  setRepoActive(repoAddr: string, active: boolean): void {
+    this.db.transaction(() => {
+      this.db.prepare('UPDATE followed_repos SET active = ?, seeded_at = NULL WHERE repo_addr = ?').run(active ? 1 : 0, repoAddr)
+      this.db.prepare('DELETE FROM ref_state WHERE repo_addr = ?').run(repoAddr)
+      this.db.prepare('DELETE FROM schedules WHERE repo_addr = ?').run(repoAddr)
+    })()
   }
 
   /**
@@ -122,7 +179,7 @@ export class WatcherDb {
   listFollowedRepos(): FollowedRepo[] {
     return this.db
       .prepare(
-        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints
+        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints, active
          FROM followed_repos ORDER BY added_at ASC`,
       )
       .all()
@@ -135,13 +192,14 @@ export class WatcherDb {
         addedAt: row.added_at,
         seededAt: row.seeded_at,
         relayHints: parseHints(row.relay_hints),
+        active: !!row.active,
       }))
   }
 
   getFollowedRepo(repoAddr: string): FollowedRepo | null {
     const row: any = this.db
       .prepare(
-        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints
+        `SELECT repo_addr, repo_owner, d_tag, default_branch, added_by, added_at, seeded_at, relay_hints, active
          FROM followed_repos WHERE repo_addr = ?`,
       )
       .get(repoAddr)
@@ -155,6 +213,7 @@ export class WatcherDb {
       addedAt: row.added_at,
       seededAt: row.seeded_at,
       relayHints: parseHints(row.relay_hints),
+      active: !!row.active,
     }
   }
 

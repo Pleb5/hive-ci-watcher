@@ -20,8 +20,10 @@ const COMMANDS: Record<string, {tool: string; usage: string; args: (rest: string
   },
   unfollow: {
     tool: 'unfollow_repo',
-    usage: 'unfollow <30617:owner:identifier>',
-    args: ([repoAddr]) => ({repo_addr: required(repoAddr, 'repo address')}),
+    usage: 'unfollow <30617:owner:identifier> [requester-pubkey | --all (operator only)]',
+    args: ([repoAddr, target]) => ({repo_addr: required(repoAddr, 'repo address'),
+      ...(target === '--all' ? {all: true} : target ? {requester_pubkey: target} : {}),
+    }),
   },
   list: {tool: 'list_followed', usage: 'list', args: () => ({})},
   status: {tool: 'status', usage: 'status', args: () => ({})},

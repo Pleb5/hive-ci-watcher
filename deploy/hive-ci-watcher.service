@@ -1,0 +1,33 @@
+[Unit]
+Description=Hive CI watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=hive-ci-watcher
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/hive-ci-watcher
+EnvironmentFile=/etc/hive-ci-watcher/watcher.env
+Environment=HIVE_CI_WATCHER_KEY_FILE=/var/lib/hive-ci-watcher/watcher.key
+Environment=HIVE_CI_WATCHER_DB=/var/lib/hive-ci-watcher/watcher.db
+ExecStart=/usr/bin/node /opt/hive-ci-watcher/dist/main.js
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+CPUQuota=100%
+MemoryMax=1536M
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

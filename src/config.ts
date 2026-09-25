@@ -2,6 +2,7 @@ import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs'
 import {dirname} from 'node:path'
 import {generateSecretKey, nip19} from 'nostr-tools'
 import {normalizeRelays} from './nostr/relays.js'
+import {loadCommunityConfig, type CommunityConfig} from './community/config.js'
 
 export {normalizeRelays}
 
@@ -50,6 +51,7 @@ export interface WatcherConfig {
    * announced commit, in ms. State events routinely precede object uploads.
    */
   fetchRetryWindowMs: number
+  communityAccess: CommunityConfig
 }
 
 const HEX64 = /^[0-9a-f]{64}$/i
@@ -127,6 +129,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig 
   const owner = env.HIVE_CI_WATCHER_OWNER_PUBKEY
   if (!owner) throw new Error('HIVE_CI_WATCHER_OWNER_PUBKEY is required')
 
+  const communityAccess = loadCommunityConfig(env.HIVE_CI_WATCHER_COMMUNITIES_FILE)
   const key = resolveSecretKey(env)
 
   return {
@@ -141,6 +144,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WatcherConfig 
       server => server.replace(/\/+$/, ''),
     ),
     fetchRetryWindowMs: parseSeconds(env.HIVE_CI_WATCHER_FETCH_RETRY_WINDOW, 600) * 1000,
+    communityAccess,
   }
 }
 

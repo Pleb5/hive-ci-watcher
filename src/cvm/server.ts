@@ -198,50 +198,59 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'follow_repo',
     {
       description:
-        'Add a repo to the follow table. Any repo — the watcher performs no maintainer check on the caller.',
+        'Register a repo for the caller. Any repo; multiple callers share one watch pipeline.',
       inputSchema: repoAddressShape,
     },
     guarded(ctx, 'follow_repo', 'allowlisted', async (args, caller) => {
       const {repoAddr, repoOwner, dTag, relayHints} = resolveRepoAddress(args)
       db.followRepo({repoAddr, repoOwner, dTag, addedBy: caller, relayHints})
-      const stored = db.getFollowedRepo(repoAddr)
-      await watcher.watchRepo(repoAddr, repoOwner, dTag, stored?.relayHints ?? relayHints)
+      await watcher.reconcileAccess()
+      const stored = db.listRegistrations(repoAddr).find(r => r.requester === caller)
       log.info('repo followed', {repoAddr, by: caller.slice(0, 12), hints: relayHints.length})
-      return ok({followed: repoAddr, relay_hints: stored?.relayHints ?? relayHints})
+      return ok({followed: repoAddr, requester: caller, relay_hints: stored?.relayHints ?? relayHints})
     }),
   )
 
   server.registerTool(
     'unfollow_repo',
     {
-      description: 'Remove a repo from the follow table, along with its ref state and schedules.',
-      inputSchema: repoAddressShape,
+      description: 'Remove your registration. The operator may target another requester or remove all registrations.',
+      inputSchema: {
+        ...repoAddressShape,
+        requester_pubkey: z.string().optional().describe('Operator only: requester whose registration to remove'),
+        all: z.boolean().optional().describe('Operator only: remove every registration for this repo'),
+      },
     },
-    guarded(ctx, 'unfollow_repo', 'allowlisted', async args => {
+    guarded(ctx, 'unfollow_repo', 'registered', async (args, caller) => {
+      if ((args.all || args.requester_pubkey) && !authorizer.isOwner(caller)) return fail(NOT_AUTHORIZED)
+      if (args.all && args.requester_pubkey) throw new Error('choose all or requester_pubkey, not both')
       const {repoAddr} = resolveRepoAddress(args)
-      await watcher.unwatchRepo(repoAddr)
-      const removed = db.unfollowRepo(repoAddr)
-      return ok({unfollowed: repoAddr, existed: removed})
+      const requester = args.all ? undefined : args.requester_pubkey ? assertPubkey(args.requester_pubkey, 'requester_pubkey') : caller
+      const removed = db.removeRegistration(repoAddr, requester)
+      await watcher.reconcileAccess()
+      return ok({unfollowed: repoAddr, existed: removed, ...(authorizer.isOwner(caller) ? {registrations_remaining: db.listRegistrations(repoAddr).length} : {})})
     }),
   )
 
   server.registerTool(
     'list_followed',
     {
-      description: 'Followed repos with their per-ref last-seen commit.',
+      description: 'Your registrations and repo state; the operator sees every registration.',
       inputSchema: {},
     },
-    guarded(ctx, 'list_followed', 'allowlisted', () =>
+    guarded(ctx, 'list_followed', 'registered', (_args, caller) =>
       ok({
-        repos: db.listFollowedRepos().map(repo => ({
+        repos: db.listFollowedRepos().filter(repo => authorizer.isOwner(caller) || db.hasRegistration(caller, repo.repoAddr)).map(repo => ({
           repo_addr: repo.repoAddr,
           repo_owner: repo.repoOwner,
           d_tag: repo.dTag,
           default_branch: repo.defaultBranch,
-          added_by: repo.addedBy,
-          added_at: repo.addedAt,
+          registrations: db.listRegistrations(repo.repoAddr).filter(r => authorizer.isOwner(caller) || r.requester === caller).map(r => ({
+            requester: r.requester, added_at: r.addedAt, relay_hints: r.relayHints,
+            eligible: authorizer.authorize(r.requester, 'allowlisted'), access: authorizer.sources(r.requester),
+          })),
+          active: repo.active && watcher.isEligible(repo.repoAddr),
           seeded_at: repo.seededAt,
-          relay_hints: repo.relayHints,
           announcement_probe: watcher.repoProbe(repo.repoAddr),
           unparseable_workflows: watcher.unparseableWorkflows(repo.repoAddr),
           refs: db.getRefStates(repo.repoAddr).map(state => ({
@@ -266,7 +275,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Uptime, relay health, runner pool size, and recent runs.',
       inputSchema: {},
     },
-    guarded(ctx, 'status', 'allowlisted', () => ok(watcher.status())),
+    guarded(ctx, 'status', 'registered', (_args, caller) => ok({
+      ...watcher.status(authorizer.isOwner(caller) ? undefined : caller),
+      access: authorizer.sources(caller),
+      ...(authorizer.isOwner(caller) ? {communities: watcher.communities.status()} : {}),
+    })),
   )
 
   server.registerTool(
@@ -342,9 +355,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description: 'Add a requester to the allowlist.',
       inputSchema: {pubkey: z.string().describe('Requester pubkey (hex)')},
     },
-    guarded(ctx, 'allow_pubkey', 'owner', args => {
+    guarded(ctx, 'allow_pubkey', 'owner', async args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
       db.allowPubkey(pubkey)
+      await watcher.reconcileAccess()
       return ok({allowed: pubkey})
     }),
   )
@@ -352,30 +366,32 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     'revoke_pubkey',
     {
-      description: 'Remove a requester from the allowlist.',
+      description: 'Remove an explicit grant. Membership in a configured community may still authorize the requester.',
       inputSchema: {pubkey: z.string().describe('Requester pubkey (hex)')},
     },
-    guarded(ctx, 'revoke_pubkey', 'owner', args => {
+    guarded(ctx, 'revoke_pubkey', 'owner', async args => {
       const pubkey = assertPubkey(args.pubkey, 'pubkey')
-      return ok({revoked: pubkey, existed: db.revokePubkey(pubkey)})
+      const existed = db.revokePubkey(pubkey)
+      await watcher.reconcileAccess()
+      return ok({revoked: pubkey, existed, access: authorizer.sources(pubkey)})
     }),
   )
 
   server.registerTool(
     'list_allowed',
     {
-      description: 'Dump the allowlist. The owner is implicitly authorized and is not listed.',
+      description: 'Explicit grants and community-derived membership, with per-community readiness. Operator only.',
       inputSchema: {},
     },
     guarded(ctx, 'list_allowed', 'owner', () =>
       ok({
         owner: ctx.config.ownerPubkey,
         allowed: db.listAllowed().map(entry => ({pubkey: entry.pubkey, added_at: entry.addedAt})),
+        derived: watcher.communities.listMembers(),
+        communities: watcher.communities.status(),
       }),
     ),
   )
-
-  void authorizer
 }
 
 export interface CvmServerHandle {

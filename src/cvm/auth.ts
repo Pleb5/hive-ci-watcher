@@ -1,6 +1,6 @@
 import type {WatcherDb} from '../db/index.js'
 
-export type ToolAudience = 'owner' | 'allowlisted'
+export type ToolAudience = 'owner' | 'allowlisted' | 'registered'
 
 /**
  * The flat refusal every unauthorized caller gets. Deliberately identical for
@@ -14,6 +14,7 @@ export class Authorizer {
   constructor(
     private readonly db: WatcherDb,
     private readonly ownerPubkey: string,
+    private readonly communities: {sources(pubkey: string): string[]} = {sources: () => []},
   ) {}
 
   isOwner(pubkey: string | undefined): boolean {
@@ -28,7 +29,14 @@ export class Authorizer {
     if (!pubkey) return false
     if (this.isOwner(pubkey)) return true
     if (audience === 'owner') return false
-    return this.db.isAllowed(pubkey.toLowerCase())
+    const normalized = pubkey.toLowerCase()
+    return this.db.isAllowed(normalized) || this.communities.sources(normalized).length > 0 ||
+      (audience === 'registered' && this.db.hasRegistration(normalized))
+  }
+
+  sources(pubkey: string) {
+    const normalized = pubkey.toLowerCase()
+    return {operator: this.isOwner(normalized), explicit: this.db.isAllowed(normalized), communities: this.communities.sources(normalized)}
   }
 }
 

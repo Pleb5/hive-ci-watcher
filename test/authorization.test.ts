@@ -9,9 +9,9 @@ const UNKNOWN = 'c'.repeat(64)
 /** Mirrors the audience each tool is registered with in `src/cvm/server.ts`. */
 const TOOL_AUDIENCES = {
   follow_repo: 'allowlisted',
-  unfollow_repo: 'allowlisted',
-  list_followed: 'allowlisted',
-  status: 'allowlisted',
+  unfollow_repo: 'registered',
+  list_followed: 'registered',
+  status: 'registered',
   list_runners: 'allowlisted',
   runners_add: 'owner',
   runners_remove: 'owner',
@@ -36,12 +36,12 @@ describe('tool authorization matrix', () => {
     db.close()
   })
 
-  it('lets an allowlisted requester through allowlisted tools only', () => {
+  it('lets an allowlisted requester through requester tools only', () => {
     const {db, authorizer} = setup()
     for (const [tool, audience] of Object.entries(TOOL_AUDIENCES)) {
       expect([tool, authorizer.authorize(ALLOWED, audience)]).toEqual([
         tool,
-        audience === 'allowlisted',
+        audience !== 'owner',
       ])
     }
     db.close()

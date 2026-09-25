@@ -3,16 +3,19 @@ import {getOutboxes} from 'applesauce-core/helpers/mailboxes'
 import {mergeRelaySets} from 'applesauce-core/helpers/relays'
 import {nip19} from 'nostr-tools'
 import {
+  BehaviorSubject,
   combineLatest,
   debounceTime,
   distinctUntilChanged,
   map,
-  of,
   shareReplay,
   switchMap,
   type Observable,
   type Subscription,
 } from 'rxjs'
+import {Authorizer} from './cvm/auth.js'
+import {CommunityAccess} from './community/service.js'
+import {RelayAuthorityTransport} from './community/transport.js'
 import type {WatcherConfig} from './config.js'
 import type {WatcherDb} from './db/index.js'
 import {dispatchRun, type DispatchOutcome, type DispatchRequest} from './dispatch/submit.js'
@@ -51,8 +54,6 @@ const SCHEDULE_TICK_MS = 60_000
 const RUNS_PRUNE_EVERY_TICKS = 60
 /** Startup: how long to wait for every default relay to EOSE the 10100 request. */
 const WORKER_DISCOVERY_TIMEOUT_MS = 10_000
-/** Follow: how long to wait before saying "no announcement found anywhere". */
-const ANNOUNCEMENT_PROBE_TIMEOUT_MS = 8_000
 /** A 30618 burst (several maintainers, several relays) is evaluated once. */
 const EVALUATE_DEBOUNCE_MS = 250
 /** Hard ceiling on one dispatch so a stalled relay or Blossom server cannot wedge a repo's queue. */
@@ -79,10 +80,17 @@ interface RepoWatch {
   announcement$: Observable<RepoAnnouncement | null>
   /** Set once the probe has run, so `list_followed` can say why a repo is idle. */
   probe: {checkedAt: number; found: boolean; relays: string[]} | null
+  hints: BehaviorSubject<string[]>
+  baselineReady: boolean
+  baselinePending?: Promise<void>
+  baselineController?: AbortController
 }
 
 export class Watcher {
   readonly nostr: NostrClient
+  readonly communities: CommunityAccess
+  readonly authorizer: Authorizer
+  private readonly authorityTransport: RelayAuthorityTransport
 
   private readonly repos = new Map<string, RepoWatch>()
   private workers = new Map<string, LoomWorker>()
@@ -95,9 +103,13 @@ export class Watcher {
 
   private scheduleTimer: NodeJS.Timeout | null = null
   private scheduleTicks = 0
-  private tickInProgress = false
+  private schedulePending?: Promise<void>
   private startedAt = 0
   private running = false
+  private readyForRepos = false
+  private reconcilePending?: Promise<void>
+  private reconcileDirty = false
+  private readonly epochs = new Map<string, number>()
 
   constructor(
     private readonly config: WatcherConfig,
@@ -105,12 +117,22 @@ export class Watcher {
     private readonly identity: WatcherIdentity,
   ) {
     this.nostr = new NostrClient(config.relays)
+    this.authorityTransport = new RelayAuthorityTransport(this.nostr.pool)
+    this.communities = new CommunityAccess(config.communityAccess, this.authorityTransport, db)
+    this.authorizer = new Authorizer(db, config.ownerPubkey, this.communities)
   }
 
   async start(): Promise<void> {
     if (this.running) return
     this.running = true
     this.startedAt = Math.floor(Date.now() / 1000)
+    // Re-establish access and seed current refs on every start. Offline or
+    // suspended changes must not become a burst of historical CI runs.
+    for (const repo of this.db.listFollowedRepos()) this.db.setRepoActive(repo.repoAddr, false)
+    this.internal.push(this.communities.changes.subscribe(() => {
+      void this.reconcileAccess().catch(error => log.error('access reconciliation failed', {error: errorMessage(error)}))
+    }))
+    const communityStartup = this.communities.start()
 
     // Worker map is a projection of the store: every 10100 we have ever
     // heard, latest per pubkey, re-derived whenever one changes.
@@ -136,12 +158,14 @@ export class Watcher {
       'workers:discovery',
     )
     log.info('worker discovery complete', {ads: ads.length, workers: this.workers.size})
+    if (!this.running) return
 
     this.internal.push(this.nostr.subscribe(this.nostr.defaults$, {kinds: [KIND_LOOM_WORKER]}, 'workers'))
 
-    for (const repo of this.db.listFollowedRepos()) {
-      await this.watchRepo(repo.repoAddr, repo.repoOwner, repo.dTag, repo.relayHints)
-    }
+    await communityStartup
+    if (!this.running) return
+    this.readyForRepos = true
+    await this.reconcileAccess()
 
     this.scheduleTimer = setInterval(() => {
       void this.runScheduleTick().catch(err =>
@@ -154,25 +178,37 @@ export class Watcher {
 
   async stop(): Promise<void> {
     this.running = false
+    this.readyForRepos = false
     if (this.scheduleTimer) clearInterval(this.scheduleTimer)
     this.scheduleTimer = null
-    for (const watch of this.repos.values()) for (const sub of watch.subscriptions) sub.unsubscribe()
+    for (const controller of this.inflight.values()) controller.abort()
+    for (const watch of this.repos.values()) watch.baselineController?.abort()
+    await this.communities.stop()
+    await this.reconcilePending
+    const watches = [...this.repos.values()]
+    for (const watch of watches) {
+      for (const sub of watch.subscriptions) sub.unsubscribe()
+      watch.hints.complete()
+    }
     this.repos.clear()
     for (const sub of this.internal) sub.unsubscribe()
     await Promise.allSettled([...this.repoQueues.values()])
+    await this.schedulePending
+    await Promise.allSettled(watches.map(watch => watch.baselinePending))
     this.nostr.close()
   }
 
-  status(): WatcherStatus {
+  status(requester?: string): WatcherStatus {
+    const visible = new Set(this.db.listRegistrations().filter(r => !requester || r.requester === requester).map(r => r.repoAddr))
     return {
       pubkey: this.identity.pubkey,
       startedAt: this.startedAt,
       uptimeSeconds: this.startedAt ? Math.floor(Date.now() / 1000) - this.startedAt : 0,
       relays: this.nostr.report(),
-      followedRepos: this.db.listFollowedRepos().length,
+      followedRepos: visible.size,
       knownWorkers: this.workers.size,
       runnerPool: this.db.listRunnerPool().length,
-      recentRuns: this.db.recentRuns(10),
+      recentRuns: this.db.recentRuns(5000).filter(run => visible.has(run.repoAddr)).slice(0, 10),
     }
   }
 
@@ -219,6 +255,49 @@ export class Watcher {
 
   // ── follow management ─────────────────────────────────────────────────────
 
+  isEligible(repoAddr: string): boolean {
+    return this.db.listRegistrations(repoAddr).some(registration => this.authorizer.authorize(registration.requester, 'allowlisted'))
+  }
+
+  /** Invalidate immediately, then serialize asynchronous stream teardown/restart. */
+  reconcileAccess(): Promise<void> {
+    for (const repo of this.db.listFollowedRepos()) {
+      if (repo.active && !this.isEligible(repo.repoAddr)) {
+        this.db.setRepoActive(repo.repoAddr, false)
+        this.epochs.set(repo.repoAddr, (this.epochs.get(repo.repoAddr) ?? 0) + 1)
+        this.inflight.get(repo.repoAddr)?.abort()
+      }
+    }
+    if (!this.readyForRepos || !this.running) return Promise.resolve()
+    this.reconcileDirty = true
+    if (this.reconcilePending) return this.reconcilePending
+    this.reconcilePending = Promise.resolve().then(async () => {
+      do {
+        this.reconcileDirty = false
+        for (const repo of this.db.listFollowedRepos()) {
+          if (!this.running) return
+          if (!this.isEligible(repo.repoAddr) || !repo.active) {
+            await this.unwatchRepo(repo.repoAddr)
+            if (!this.running) return
+            // An evaluation interrupted during an await may have recorded
+            // progress; reseed only after that evaluation has finished.
+            this.db.setRepoActive(repo.repoAddr, false)
+          }
+          if (!this.db.listRegistrations(repo.repoAddr).length) {
+            this.db.unfollowRepo(repo.repoAddr)
+            continue
+          }
+          if (!this.isEligible(repo.repoAddr)) continue
+          if (!this.db.getFollowedRepo(repo.repoAddr)?.active) this.db.setRepoActive(repo.repoAddr, true)
+          const hints = [...new Set(this.db.listRegistrations(repo.repoAddr)
+            .filter(r => this.authorizer.authorize(r.requester, 'allowlisted')).flatMap(r => r.relayHints))]
+          await this.watchRepo(repo.repoAddr, repo.repoOwner, repo.dTag, hints)
+        }
+      } while (this.reconcileDirty && this.running)
+    }).finally(() => { this.reconcilePending = undefined })
+    return this.reconcilePending
+  }
+
   /**
    * Wires one repo as a set of streams:
    *
@@ -231,13 +310,18 @@ export class Watcher {
    * arriving late, reshapes the REQs without tearing anything down.
    */
   async watchRepo(repoAddr: string, owner: string, dTag: string, hints: string[] = []): Promise<void> {
-    if (this.repos.has(repoAddr)) return
+    const existing = this.repos.get(repoAddr)
+    if (existing) {
+      existing.hints.next(normalizeRelays(hints))
+      return
+    }
 
     const store = this.nostr.store
     const hintRelays = normalizeRelays(hints)
+    const hints$ = new BehaviorSubject(hintRelays)
     const subscriptions: Subscription[] = []
 
-    const announcementRelays$ = combineLatest([of(hintRelays), this.nostr.outboxes$(owner)]).pipe(
+    const announcementRelays$ = combineLatest([hints$, this.nostr.outboxes$(owner)]).pipe(
       map(([h, outboxes]) => mergeRelaySets(h, outboxes)),
       distinctUntilChanged((a, b) => a.join(',') === b.join(',')),
     )
@@ -301,40 +385,48 @@ export class Watcher {
         .subscribe(() => this.enqueue(repoAddr, signal => this.evaluateRepo(repoAddr, signal))),
     )
 
-    const watch: RepoWatch = {repoAddr, owner, dTag, subscriptions, announcement$, probe: null}
+    const watch: RepoWatch = {repoAddr, owner, dTag, subscriptions, announcement$, probe: null, hints: hints$, baselineReady: false}
     this.repos.set(repoAddr, watch)
 
-    // Say so if the announcement is nowhere we can see. The live subscription
-    // stays up regardless — a relay may serve it later — but silence here is
-    // the failure mode an operator cannot otherwise diagnose.
-    void this.probeAnnouncement(watch, hintRelays).catch(err =>
-      log.warn('announcement probe failed', {repoAddr, error: errorMessage(err)}),
-    )
+    void this.hydrateRepo(watch)
   }
 
-  private async probeAnnouncement(watch: RepoWatch, hintRelays: string[]): Promise<void> {
-    // Give the owner's 10002 a moment to arrive so their outboxes are probed too.
-    await new Promise(resolve => setTimeout(resolve, 2_000))
-    const outboxes = await firstOutboxes(this.nostr, watch.owner)
-    const relays = normalizeRelays(mergeRelaySets(this.nostr.defaults, hintRelays, outboxes))
+  private hydrateRepo(watch: RepoWatch): Promise<void> {
+    if (watch.baselinePending) return watch.baselinePending
+    watch.baselinePending = this.loadRepoBaseline(watch).finally(() => { watch.baselinePending = undefined })
+    return watch.baselinePending
+  }
 
-    const found = await this.nostr.requestAll(
-      relays,
-      {kinds: [KIND_REPO_ANNOUNCEMENT], authors: [watch.owner], '#d': [watch.dTag]},
-      ANNOUNCEMENT_PROBE_TIMEOUT_MS,
-      `probe:${watch.repoAddr}`,
-    )
-    const present = found.length > 0 || !!this.nostr.store.getReplaceable(KIND_REPO_ANNOUNCEMENT, watch.owner, watch.dTag)
-    watch.probe = {checkedAt: Math.floor(Date.now() / 1000), found: present, relays}
-
-    if (!present) {
-      log.warn('repo announcement not found on any reachable relay', {
-        repoAddr: watch.repoAddr,
-        relays,
-        ownerOutboxes: outboxes.length,
-        hint: 'follow with an naddr carrying relay hints, or ask the owner to publish a kind 10002',
-      })
-    }
+  /** A cached pre-suspension state is not a restart baseline. Wait for actual EOSE. */
+  private async loadRepoBaseline(watch: RepoWatch): Promise<void> {
+    const controller = new AbortController()
+    watch.baselineController = controller
+    const deadline = setTimeout(() => controller.abort(), 60000)
+    const current = () => this.running && !controller.signal.aborted && this.repos.get(watch.repoAddr) === watch && this.isEligible(watch.repoAddr)
+    try {
+      const outboxes = await firstOutboxes(this.nostr, watch.owner)
+      if (!current()) return
+      const relays = normalizeRelays(mergeRelaySets(this.nostr.defaults, watch.hints.value, outboxes))
+      const found = await this.authorityTransport.query(relays,
+        {kinds: [KIND_REPO_ANNOUNCEMENT], authors: [watch.owner], '#d': [watch.dTag]}, controller.signal)
+      if (!current()) return
+      found.forEach(event => this.nostr.store.add(event))
+      const announcement = this.currentAnnouncement(watch)
+      watch.probe = {checkedAt: Math.floor(Date.now() / 1000), found: !!announcement, relays}
+      if (!announcement) return
+      for (const maintainer of announcement.maintainers) {
+        const maintainerOutboxes = await firstOutboxes(this.nostr, maintainer)
+        const events = await this.authorityTransport.query(mergeRelaySets(relays, announcement.relays, maintainerOutboxes),
+          {kinds: [KIND_REPO_STATE], authors: [maintainer], '#d': [watch.dTag]}, controller.signal)
+        if (!current()) return
+        events.forEach(event => this.nostr.store.add(event))
+      }
+      if (this.currentAnnouncement(watch)?.event.id !== announcement.event.id) return
+      watch.baselineReady = true
+      this.enqueue(watch.repoAddr, signal => this.evaluateRepo(watch.repoAddr, signal))
+    } catch (error) {
+      if (current()) log.warn('repo baseline incomplete; will retry', {repoAddr: watch.repoAddr, error: errorMessage(error)})
+    } finally { clearTimeout(deadline) }
   }
 
   /**
@@ -344,14 +436,18 @@ export class Watcher {
    */
   async unwatchRepo(repoAddr: string): Promise<void> {
     const watch = this.repos.get(repoAddr)
+    watch?.baselineController?.abort()
     if (watch) for (const sub of watch.subscriptions) sub.unsubscribe()
+    watch?.hints.complete()
     this.repos.delete(repoAddr)
     this.trees.invalidateRepo(repoAddr)
     this.inflight.get(repoAddr)?.abort()
     this.inflight.delete(repoAddr)
     const pending = this.repoQueues.get(repoAddr)
     if (pending) await pending.catch(() => undefined)
+    await watch?.baselinePending
     this.repoQueues.delete(repoAddr)
+    this.unparseable.delete(repoAddr)
   }
 
   /**
@@ -397,8 +493,9 @@ export class Watcher {
   }
 
   private async evaluateRepo(repoAddr: string, signal: AbortSignal): Promise<void> {
+    if (!this.isEligible(repoAddr) || !this.db.getFollowedRepo(repoAddr)?.active) return
     const watch = this.repos.get(repoAddr)
-    if (!watch) return
+    if (!watch?.baselineReady) return
 
     const announcement = this.currentAnnouncement(watch)
     if (!announcement) {
@@ -473,6 +570,8 @@ export class Watcher {
         signal,
       })
 
+      if (signal.aborted || !this.isEligible(repoAddr)) return
+
       if (completion === 'superseded') {
         log.info('evaluation superseded by a newer state', {repoAddr, phase: 'ref', ref: change.descriptor.ref})
         return
@@ -527,6 +626,7 @@ export class Watcher {
 
     let completion: Completion = 'complete'
     for (const workflowPath of paths) {
+      if (args.signal.aborted) return 'superseded'
       const outcome = await this.dispatch({
         repoAddr: args.repoAddr,
         workflowPath,
@@ -536,23 +636,32 @@ export class Watcher {
         commitId: args.commitId,
         repoRelays: args.announcement.relays,
       })
+      if (args.signal.aborted) return 'superseded'
       if (outcome.status !== 'dispatched') completion = 'incomplete'
     }
     return completion
   }
 
   private async dispatch(request: DispatchRequest): Promise<DispatchOutcome> {
+    const epoch = this.epochs.get(request.repoAddr) ?? 0
+    let expired = false
     const deps = {
       config: this.config,
       db: this.db,
       identity: this.identity,
       nostr: this.nostr,
       workers: () => this.workers,
+      mayDispatch: () => !expired && this.running && this.isEligible(request.repoAddr) &&
+        (this.epochs.get(request.repoAddr) ?? 0) === epoch &&
+        !!this.db.getFollowedRepo(request.repoAddr)?.active && this.db.getFollowedRepo(request.repoAddr)?.seededAt != null,
     }
     let timer: NodeJS.Timeout | undefined
     const deadline = new Promise<DispatchOutcome>(resolve => {
       timer = setTimeout(
-        () => resolve({status: 'failed', error: `dispatch exceeded ${DISPATCH_DEADLINE_MS} ms`}),
+        () => {
+          expired = true
+          resolve({status: 'failed', error: `dispatch exceeded ${DISPATCH_DEADLINE_MS} ms`})
+        },
         DISPATCH_DEADLINE_MS,
       )
     })
@@ -668,53 +777,59 @@ export class Watcher {
 
   // ── schedule pipeline (§3.3) ──────────────────────────────────────────────
 
-  async runScheduleTick(nowMs = Date.now()): Promise<void> {
+  runScheduleTick(nowMs = Date.now()): Promise<void> {
     // A tick stalled on a dispatch is not joined by the next one; it is
     // skipped and logged, so a stall surfaces instead of piling up.
-    if (this.tickInProgress) {
+    if (this.schedulePending) {
       log.warn('schedule tick still running, skipping this one')
-      return
+      return Promise.resolve()
     }
-    this.tickInProgress = true
-    try {
-      this.scheduleTicks += 1
-      if (this.scheduleTicks % RUNS_PRUNE_EVERY_TICKS === 0) {
-        const pruned = this.db.pruneRuns()
-        if (pruned > 0) log.debug('pruned run history', {pruned})
+    if (!this.running) return Promise.resolve()
+    this.schedulePending = this.evaluateSchedules(nowMs).finally(() => { this.schedulePending = undefined })
+    return this.schedulePending
+  }
+
+  private async evaluateSchedules(nowMs: number): Promise<void> {
+    this.scheduleTicks += 1
+    for (const watch of this.repos.values()) if (!watch.baselineReady) void this.hydrateRepo(watch)
+    if (this.scheduleTicks % RUNS_PRUNE_EVERY_TICKS === 0) {
+      const pruned = this.db.pruneRuns()
+      if (pruned > 0) log.debug('pruned run history', {pruned})
+    }
+
+    const due = selectDueSchedules(this.db.listSchedules(), nowMs).map(entry => ({
+      ...entry, epoch: this.epochs.get(entry.schedule.repoAddr) ?? 0,
+    }))
+    for (const entry of due) {
+      const {repoAddr, workflowPath} = entry.schedule
+      if (!this.running || !this.isEligible(repoAddr) || !this.db.getFollowedRepo(repoAddr)?.active ||
+        (this.epochs.get(repoAddr) ?? 0) !== entry.epoch) continue
+      this.db.markScheduleFired(repoAddr, workflowPath, Math.floor(nowMs / 1000))
+
+      const watch = this.repos.get(repoAddr)
+      const announcement = watch ? this.currentAnnouncement(watch) : null
+      const followed = this.db.getFollowedRepo(repoAddr)
+      if (!watch?.baselineReady || !announcement || !followed) continue
+
+      const defaultBranch = followed.defaultBranch ?? 'main'
+      const ref = `refs/heads/${defaultBranch}`
+      const commitId = this.db
+        .getRefStates(repoAddr)
+        .find(state => state.ref === ref && !state.deletedAt)?.commitId
+      if (!commitId) {
+        log.warn('scheduled run has no known default-branch commit', {repoAddr, ref})
+        continue
       }
 
-      const due = selectDueSchedules(this.db.listSchedules(), nowMs)
-      for (const entry of due) {
-        const {repoAddr, workflowPath} = entry.schedule
-        this.db.markScheduleFired(repoAddr, workflowPath, Math.floor(nowMs / 1000))
-
-        const watch = this.repos.get(repoAddr)
-        const announcement = watch ? this.currentAnnouncement(watch) : null
-        const followed = this.db.getFollowedRepo(repoAddr)
-        if (!announcement || !followed) continue
-
-        const defaultBranch = followed.defaultBranch ?? 'main'
-        const ref = `refs/heads/${defaultBranch}`
-        const commitId = this.db
-          .getRefStates(repoAddr)
-          .find(state => state.ref === ref && !state.deletedAt)?.commitId
-        if (!commitId) {
-          log.warn('scheduled run has no known default-branch commit', {repoAddr, ref})
-          continue
-        }
-
-        await this.dispatch({
-          repoAddr,
-          workflowPath,
-          trigger: 'schedule',
-          ref,
-          branch: defaultBranch,
-          commitId,
-          repoRelays: announcement.relays,
-        })
-      }
-    } finally {
-      this.tickInProgress = false
+      await this.dispatch({
+        repoAddr,
+        workflowPath,
+        trigger: 'schedule',
+        ref,
+        branch: defaultBranch,
+        commitId,
+        repoRelays: announcement.relays,
+      })
     }
   }
 }
@@ -744,4 +859,3 @@ export function resolveDefaultBranch(state: RepoState, recorded: string | null):
   }
   return branches[0] ?? 'main'
 }
-

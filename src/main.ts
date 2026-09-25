@@ -1,7 +1,6 @@
 import './env-defaults.js'
 import {nip19} from 'nostr-tools'
 import {loadConfig} from './config.js'
-import {Authorizer} from './cvm/auth.js'
 import {startCvmServer, type CvmServerHandle} from './cvm/server.js'
 import {WatcherDb} from './db/index.js'
 import {WatcherIdentity} from './identity.js'
@@ -64,13 +63,14 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'))
 
   await watcher.start()
+  if (shuttingDown) return
 
   cvm = await startCvmServer({
     config,
     db,
     identity,
     watcher,
-    authorizer: new Authorizer(db, config.ownerPubkey),
+    authorizer: watcher.authorizer,
   })
 }
 

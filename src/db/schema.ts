@@ -15,8 +15,18 @@ CREATE TABLE IF NOT EXISTS followed_repos (
   seeded_at      INTEGER,
   -- JSON array of relay URLs the follower supplied (an naddr's hints).
   -- Unioned into the announcement and state subscriptions for this repo.
-  relay_hints    TEXT NOT NULL DEFAULT '[]'
+  relay_hints    TEXT NOT NULL DEFAULT '[]',
+  active         INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS repo_registrations (
+  repo_addr TEXT NOT NULL REFERENCES followed_repos(repo_addr) ON DELETE CASCADE,
+  requester TEXT NOT NULL,
+  added_at INTEGER NOT NULL,
+  relay_hints TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (repo_addr, requester)
+);
+CREATE INDEX IF NOT EXISTS registrations_requester_idx ON repo_registrations(requester);
 
 -- ref is the full name: refs/heads/main, refs/tags/v1.2.0
 -- A ref that disappears from the state event is tombstoned (deleted_at set),

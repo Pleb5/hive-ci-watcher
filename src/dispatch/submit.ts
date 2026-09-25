@@ -40,6 +40,8 @@ export interface DispatchDeps {
   nostr: NostrClient
   /** Latest 10100 per worker pubkey. */
   workers: () => Map<string, LoomWorker>
+  /** Rechecked after asynchronous work, immediately before either publication. */
+  mayDispatch: () => boolean
 }
 
 /**
@@ -58,6 +60,7 @@ export type DispatchOutcome =
   | {status: 'dispatched'; runId: string; runnerPubkey: string}
   | {status: 'no-runner'}
   | {status: 'failed'; error: string}
+  | {status: 'inactive'}
 
 function hexFromBytes(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString('hex')
@@ -91,6 +94,7 @@ export async function dispatchRun(
   request: DispatchRequest,
 ): Promise<DispatchOutcome> {
   const {config, db, identity, nostr} = deps
+  if (!deps.mayDispatch()) return {status: 'inactive'}
 
   const allowed = db.listRunnerPool().map(entry => entry.pubkey)
   const eligible = eligibleRunners({allowed, workers: deps.workers()})
@@ -135,6 +139,7 @@ export async function dispatchRun(
       }),
     )
 
+    if (!deps.mayDispatch()) return {status: 'inactive'}
     const runPublish = await nostr.publish(publishRelays, runEvent, MIN_ACCEPTING_RELAYS)
     const runId = runEvent.id
 
@@ -160,6 +165,7 @@ export async function dispatchRun(
       }),
     )
 
+    if (!deps.mayDispatch()) return {status: 'inactive'}
     const jobPublish = await nostr.publish(publishRelays, jobEvent, MIN_ACCEPTING_RELAYS)
 
     db.recordRun({

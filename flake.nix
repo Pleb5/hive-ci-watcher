@@ -154,6 +154,16 @@
             description = "SQLite database path.";
           };
 
+          communitiesFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = ''
+              Runtime path to the community-access JSON configuration, for example
+              /etc/hive-ci-watcher/communities.json. Must be readable by the service.
+              Changes take effect on restart. Unset uses operator/manual grants only.
+            '';
+          };
+
           logLevel = lib.mkOption {
             type = lib.types.enum ["debug" "info" "warn" "error"];
             default = "info";
@@ -181,6 +191,7 @@
               HIVE_CI_WATCHER_OWNER_PUBKEY = cfg.ownerPubkey;
               HIVE_CI_WATCHER_KEY_FILE = lib.mkIf (cfg.persistKey && cfg.nsecFile == null) "/var/lib/hive-ci-watcher/watcher.key";
               HIVE_CI_WATCHER_DB = cfg.databasePath;
+              HIVE_CI_WATCHER_COMMUNITIES_FILE = lib.mkIf (cfg.communitiesFile != null) cfg.communitiesFile;
               HIVE_CI_WATCHER_RELAYS = lib.concatStringsSep "," cfg.relays;
               HIVE_CI_WATCHER_BLOSSOM_SERVERS = lib.concatStringsSep "," cfg.blossomServers;
               HIVE_CI_WATCHER_LOG_LEVEL = cfg.logLevel;

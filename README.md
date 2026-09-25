@@ -40,12 +40,33 @@ Whichever way, the watcher pubkey must be present in each loom worker's
 | `HIVE_CI_WATCHER_KEY_FILE` | no | — (unset: a fresh key per boot) |
 | `HIVE_CI_WATCHER_OWNER_PUBKEY` | yes | — |
 | `HIVE_CI_WATCHER_DB` | no | `./watcher.db` |
+| `HIVE_CI_WATCHER_COMMUNITIES_FILE` | no | — (operator and explicit grants only) |
 | `HIVE_CI_WATCHER_RELAYS` | no | `wss://relay.budabit.club,wss://nos.lol,wss://relay.damus.io` |
 | `HIVE_CI_WATCHER_BLOSSOM_SERVERS` | no | `https://blossom.budabit.club,https://blossom.primal.net,https://cdn.sovbit.host` |
 | `HIVE_CI_WATCHER_FETCH_RETRY_WINDOW` | no | `600` (seconds; state events precede object uploads, so the remote is polled) |
 | `HIVE_CI_WATCHER_LOG_LEVEL` | no | `info` |
 
 When given, the nsec is read in plaintext for v1; NIP-49 is deferred.
+
+### Community-derived access
+
+Set `HIVE_CI_WATCHER_COMMUNITIES_FILE=/etc/hive-ci-watcher/communities.json`
+to admit effective members of multiple Communikeys V2 communities. The JSON
+contains a `communities` array of `{address, relays}` entries, plus optional
+`refreshSeconds` (default 60) and `maxAgeSeconds` (default 300). Each address is
+an exact `32222:<owner-hex>:<community-id>` coordinate; each entry needs at least
+one `wss://` relay. Edit the file over SSH and restart the service to apply it.
+
+Membership in **any ready configured community** qualifies. Definitions and
+grant-list replacements, effective person bans, and valid report retractions
+are applied live. Deletion requests for kind **32222** definitions and kind
+**30000** grant lists are deliberately ignored. Operator authority and manual
+`allow` grants remain independent access sources.
+
+See [community access](docs/community-access.md) for a complete example,
+freshness/restart behavior, API changes, migration, and protocol provenance.
+An [Ubuntu/systemd unit](deploy/hive-ci-watcher.service) is included for a
+small pilot; it limits the daemon to one CPU and 1.5 GiB RAM.
 
 ## CLI
 
@@ -54,7 +75,7 @@ a running daemon. Both ends use the configured relays plus
 `wss://relay.contextvm.org` and `wss://relay2.contextvm.org`.
 
 ```sh
-export HIVE_CI_WATCHER_CLI_NSEC=nsec1...   # owner, or an allowlisted requester
+export HIVE_CI_WATCHER_CLI_NSEC=nsec1...   # operator, explicitly allowed requester, or community member
 export HIVE_CI_WATCHER_PUBKEY=<daemon pubkey>
 
 hive-ci-watcher status
@@ -64,6 +85,8 @@ hive-ci-watcher follow 30617:<owner-pubkey>:<identifier>
 hive-ci-watcher follow naddr1...                    # relay hints in the naddr are used
 hive-ci-watcher follow 30617:<owner>:<id> wss://relay.example   # or pass hints explicitly
 hive-ci-watcher list                                # includes the announcement probe result
+hive-ci-watcher unfollow 30617:<owner>:<id>            # remove your registration
+hive-ci-watcher unfollow 30617:<owner>:<id> --all      # operator: remove every registration
 ```
 
 If `list` shows `announcement_probe.found: false`, the repo's 30617 is on no
@@ -71,10 +94,17 @@ relay the watcher can see. The watcher already consults the owner's NIP-65
 relay list; the remaining fix is to follow with an naddr carrying the right
 relay, or ask the owner to publish a kind 10002.
 
-`runners-add`, `runners-remove`, `allow`, `revoke` and `allowed` are owner-only.
-Everything else is open to the allowlist. Unknown callers get a flat
-"not authorized" — the daemon does not disclose whether a pubkey exists in the
-allowlist.
+`runners-add`, `runners-remove`, `allow`, `revoke` and `allowed` are operator-only.
+Eligible requesters may register any repo. Each requester owns a separate
+registration; multiple registrations share one pipeline. `unfollow` removes
+only your registration, and watching continues while another eligible
+registration remains. `list` and recent runs in `status` are scoped to your
+registrations; the operator sees all of them. After losing eligibility you
+can still inspect and remove your existing registrations. Unknown callers
+get a flat "not authorized".
+
+`allowed` shows explicit grants, derived members and their community sources,
+and per-community readiness. `revoke` removes only the explicit grant.
 
 ## Order of operations for a new deployment
 
@@ -124,6 +154,7 @@ Every 5100 the watcher publishes omits the `payment` tag entirely.
     enable = true;
     ownerPubkey = "npub1...";
     persistKey = true;   # keep a generated key in /var/lib/hive-ci-watcher
+    communitiesFile = "/etc/hive-ci-watcher/communities.json";
     logLevel = "debug";      # watcher logger
     sdkLogLevel = "warn";    # ContextVM / applesauce (pino); "trace" for every relay message
     # nsecFile = config.sops.secrets.hive-ci-watcher-nsec.path;  # or bring your own
@@ -167,8 +198,8 @@ can build itself through its own pipeline.
 
 ## Trust model
 
-Allowlisted requesters are trusted as near co-owners: any repo, unfollow
-anyone's, no quotas. Each repo they follow hands its owner control of the
-clone URLs the watcher fetches from and the relays it connects to. See
-DESIGN.md §8 before growing the allowlist beyond people you would hand the
-owner key to.
+Eligible requesters can register any repo and consume the configured runner
+pool, with no per-requester quotas. They control only their own registrations.
+Community owners manage membership but gain no watcher-operator authority.
+Each registered repo's owner controls its clone URLs, relays, maintainers,
+and workflows. See DESIGN.md §8.
